@@ -1,209 +1,238 @@
-# app.py — Riteway AI Voice Agent (Twilio <-> OpenAI Realtime)
-# Env vars on Render:
-#   OPENAI_API_KEY   (required)
-#   REALTIME_MODEL   (optional, default: gpt-4o-realtime-preview)
-#
-# Render start command:
-#   uvicorn app:app --host 0.0.0.0 --port $PORT
-
 import os
 import json
-import base64
-import audioop  # stdlib
-import asyncio
-import traceback
-
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response, PlainTextResponse, JSONResponse
+import logging
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-import aiohttp
+from fastapi.responses import PlainTextResponse
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
+###############################################################################
+# 0. BASIC SETUP
+#
+# - We create a FastAPI server.
+# - We add CORS just in case (lets Twilio / browsers hit us).
+# - We add logging so Render logs are useful.
+###############################################################################
 
-app = FastAPI(title="Riteway AI Agent")
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],        # allow anything for now
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def ulaw8k_b64_to_pcm16_24k_b64(ulaw_b64: str) -> str:
-    """Twilio -> OpenAI: μ-law@8k (b64) -> PCM16@24k (b64)."""
-    ulaw_bytes = base64.b64decode(ulaw_b64)       # μ-law, 8k, mono
-    pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)    # -> PCM16 8k
-    pcm16_24k, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 24000, None)
-    return base64.b64encode(pcm16_24k).decode("ascii")
+###############################################################################
+# 1. HEALTH CHECK
+#
+# Render pings this so it knows your service is alive.
+# You can also hit this in your browser: 
+# https://riteway-ai-agent.onrender.com/health
+###############################################################################
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "riteway"}
 
 
-# -----------------------------------------------------------------------------
-# 1) Twilio webhook -> TwiML (MUST return valid XML with 200 OK)
-# -----------------------------------------------------------------------------
-@app.post("/voice")
-async def voice_post(_: Request):
-    try:
-        print("📞 /voice POST hit by Twilio")
-        twiml = """<?xml version="1.0" encoding="UTF-8"?>
+###############################################################################
+# 2. TWILIO VOICE WEBHOOK (/voice)
+#
+# Twilio will POST here when someone calls your Twilio number.
+#
+# We respond with TwiML (Twilio’s little XML language) that tells Twilio:
+#   "connect the caller’s audio to my websocket at /media"
+#
+# IMPORTANT:
+# - <Connect><Stream> = bidirectional audio. Twilio will try to open a
+#   secure WebSocket (wss://...) back to /media below.
+#
+# - If /media crashes or refuses the WebSocket handshake, the caller hears
+#   "An application error has occurred" and Twilio hangs up.
+#
+# So fixing /media stability fixes that message.
+###############################################################################
+
+@app.post("/voice", response_class=PlainTextResponse)
+async def voice():
+    logging.info("Twilio hit /voice webhook")
+
+    # <<IMPORTANT>>
+    # Twilio expects valid XML, content-type: application/xml.
+    # FastAPI will send text, which Twilio accepts fine if it's valid TwiML.
+    #
+    # NOTE: While this stream is active Twilio does NOT say anything to the caller.
+    # So the caller just hears silence right now.
+    # That's normal for this step. We'll add talking later.
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect>
-    <Stream url="wss://riteway-ai-agent.onrender.com/media" />
-  </Connect>
+    <Connect>
+        <Stream url="wss://riteway-ai-agent.onrender.com/media" />
+    </Connect>
 </Response>"""
-        # IMPORTANT: Twilio expects XML content type
-        return Response(content=twiml, media_type="application/xml")
-    except Exception as e:
-        print("❌ /voice error:", e)
-        traceback.print_exc()
-        # Twilio treats non-200 as "Application Error"
-        return Response(content="<Response></Response>", media_type="application/xml", status_code=200)
-
-# Optional GET so you can open /voice in a browser for a quick check
-@app.get("/voice")
-async def voice_get():
-    twiml = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="wss://riteway-ai-agent.onrender.com/media" />
-  </Connect>
-</Response>"""
-    return Response(content=twiml, media_type="application/xml")
+    return PlainTextResponse(content=twiml, media_type="application/xml")
 
 
-# -----------------------------------------------------------------------------
-# 2) Media WebSocket: Twilio <-> OpenAI Realtime bridge
-# -----------------------------------------------------------------------------
+###############################################################################
+# 3. MEDIA STREAM ENDPOINT (/media)
+#
+# This is the MOST important part.
+#
+# Twilio will try to open a secure WebSocket to:
+#   wss://riteway-ai-agent.onrender.com/media
+#
+# Then Twilio will start sending JSON messages like:
+#
+#   {"event":"connected", ...}
+#   {"event":"start", "streamSid":"XYZ", ...}
+#   {"event":"media", "media":{"payload":"...base64 audio..."}, ... }
+#   {"event":"stop", ...}
+#
+# What we do in this version:
+#   - Accept the WebSocket.
+#   - Listen and log what Twilio sends.
+#   - Keep the socket open so Twilio stays happy.
+#   - DO NOT crash. (Crashing = Twilio says "application error".)
+#
+# What we are NOT doing yet:
+#   - Sending audio back to Twilio (so caller hears silence).
+#   - Sending audio to OpenAI.
+#
+# Why?
+#   Because first we need a rock-solid connection with ZERO crashes.
+#   Once that's stable, we add the AI brain + voice on top.
+###############################################################################
+
 @app.websocket("/media")
-async def media(ws: WebSocket):
-    await ws.accept()
-    print("✅ Twilio connected to /media")
+async def media_stream(websocket: WebSocket):
+    # Step 1. Accept the websocket upgrade from Twilio.
+    #
+    # If we FAIL here (throw an error before accept), Twilio's going to
+    # immediately bail with error 31920 and your caller hears
+    # "an application error has occurred".
+    #
+    await websocket.accept()
+    logging.info("✅ Twilio connected to /media WebSocket")
 
-    if not OPENAI_API_KEY:
-        print("❌ Missing OPENAI_API_KEY — closing socket")
-        await ws.close()
-        return
-
-    twilio_stream_sid = None
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "OpenAI-Beta": "realtime=v1",
-    }
+    # We'll store the Twilio streamSid so we know which call we're dealing with.
+    stream_sid = None
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(
-                f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}",
-                headers=headers,
-                autoping=True,
-                heartbeat=20,
-                timeout=0,
-            ) as oai_ws:
-                # Configure realtime session (server-side VAD = auto-commit + auto-response)
-                await oai_ws.send_json({
-                    "type": "session.update",
-                    "session": {
-                        "modalities": ["audio"],
-                        "input_audio_format":  {"type": "pcm16", "sample_rate_hz": 24000},
-                        "output_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
-                        "voice": "alloy",
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.5,
-                            "silence_duration_ms": 200,
-                            "create_response": True
-                        },
-                        "instructions": (
-                            "You are the phone receptionist for Riteway Landscape Materials "
-                            "in Grantsville, Utah. Be brief, friendly, and professional. "
-                            "Collect: caller name, callback number, address, material, "
-                            "quantity (yards/tons), and preferred delivery window. "
-                            "If unsure on pricing, give a range and say you will text "
-                            "a confirmed quote."
-                        ),
-                    }
-                })
+        # Step 2. Main receive loop.
+        #
+        # We sit in a while True and keep reading messages from Twilio.
+        # Each message is text JSON.
+        #
+        while True:
+            # Wait for Twilio to send us something.
+            # If caller hangs up, this will raise WebSocketDisconnect and jump to `except` below.
+            raw_msg = await websocket.receive_text()
 
-                # Initial greeting
-                await oai_ws.send_json({
-                    "type": "response.create",
-                    "response": {"instructions": "Hi! This is Riteway. How can I help you today?"}
-                })
+            # Parse it so we can see what Twilio said.
+            try:
+                data = json.loads(raw_msg)
+            except json.JSONDecodeError:
+                logging.warning(f"Got non-JSON message from Twilio: {raw_msg}")
+                continue
 
-                async def twilio_to_openai():
-                    nonlocal twilio_stream_sid
-                    async for message in ws.iter_text():
-                        data = json.loads(message)
-                        event = data.get("event")
+            event_type = data.get("event")
+            logging.info(f"📞 Twilio event: {event_type}")
 
-                        if event == "start":
-                            twilio_stream_sid = data.get("start", {}).get("streamSid")
-                            print("Twilio start: streamSid =", twilio_stream_sid)
+            # --- Handle specific events Twilio sends us ----------------------
 
-                        elif event == "media":
-                            try:
-                                ulaw_b64 = data["media"]["payload"]
-                                pcm24_b64 = ulaw8k_b64_to_pcm16_24k_b64(ulaw_b64)
-                                await oai_ws.send_json({
-                                    "type": "input_audio_buffer.append",
-                                    "audio": pcm24_b64
-                                })
-                            except Exception as e:
-                                print("media convert/append error:", e)
-                                traceback.print_exc()
+            # 3a. "connected" happens when the media stream is first opened.
+            if event_type == "connected":
+                logging.info("Twilio says: connected")
 
-                        elif event == "stop":
-                            print("Twilio stop event")
-                            break
+                # We *could* reply to Twilio here in future with audio,
+                # but for now we stay quiet. Silence = no crash.
 
-                async def openai_to_twilio():
-                    nonlocal twilio_stream_sid
-                    async for msg in oai_ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            payload = json.loads(msg.data)
-                            typ = payload.get("type", "")
-                            print("OAI event:", typ)
+            # 3b. "start" tells us the call officially started streaming.
+            elif event_type == "start":
+                stream_sid = data.get("streamSid")
+                call_sid = data.get("start", {}).get("callSid")
+                logging.info(f"Stream started. streamSid={stream_sid} callSid={call_sid}")
 
-                            if typ == "response.audio.delta":
-                                # Already μ-law@8k as requested
-                                chunk_b64 = payload.get("delta")
-                                if chunk_b64 and twilio_stream_sid:
-                                    await ws.send_json({
-                                        "event": "media",
-                                        "streamSid": twilio_stream_sid,
-                                        "media": {"payload": chunk_b64}
-                                    })
+                # LATER:
+                #   - Here is where we’ll tell OpenAI “the call began”.
+                #   - We'll also send the first spoken line from Riteway to the caller.
 
-                            elif typ == "error":
-                                print("OpenAI error:", payload)
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            print("OpenAI WS error frame")
-                            break
+            # 3c. "media" is the actual audio chunks from the caller.
+            elif event_type == "media":
+                # Twilio gives us 20ms chunks of the caller's audio
+                # (base64-encoded 8kHz mu-law).
+                payload_b64 = data.get("media", {}).get("payload")
 
-                try:
-                    await asyncio.gather(twilio_to_openai(), openai_to_twilio())
-                except WebSocketDisconnect:
-                    print("❌ Twilio websocket disconnected")
-                finally:
-                    await oai_ws.close()
+                # For debugging only:
+                if payload_b64:
+                    logging.info(f"✅ got audio chunk len={len(payload_b64)} (base64 chars)")
+
+                # LATER:
+                #   - We'll forward this audio to OpenAI realtime.
+                #   - We'll get OpenAI's spoken answer back.
+                #   - We'll send that answer audio back to Twilio so the caller hears it.
+
+                # RIGHT NOW:
+                #   We are *not* sending anything back to Twilio, on purpose,
+                #   just keeping the stream alive.
+
+            # 3d. "mark" events can show playback markers if we send audio
+            #     back to Twilio. We're not doing that yet, so just log.
+            elif event_type == "mark":
+                logging.info(f"Mark event: {data}")
+
+            # 3e. "stop" means Twilio is ending the stream (call ended or hangup).
+            elif event_type == "stop":
+                logging.info("Twilio says: stop (caller probably hung up)")
+                break
+
+            # Anything else, just log for now.
+            else:
+                logging.info(f"Other event from Twilio: {data}")
+
+        # End while True loop
+
+    except WebSocketDisconnect:
+        # This means Twilio hung up / closed the socket. Totally normal.
+        logging.info("❌ WebSocketDisconnect (caller hung up)")
 
     except Exception as e:
-        # If anything goes wrong above, log it instead of crashing the process.
-        print("❌ /media fatal error:", e)
-        traceback.print_exc()
+        # ANY other exception means our code blew up.
+        # If we let this kill the socket instantly, Twilio
+        # will tell the caller "an application error has occurred"
+        # and hang up.
+        #
+        # We log the error but DO NOT re-raise, so the process
+        # stays alive on Render.
+        logging.exception("💥 ERROR inside /media loop (we caught it so Twilio won't insta-fail)")
+
+    finally:
+        # Step 3. Cleanup.
+        #
+        # Close websocket nicely if it's still open.
         try:
-            await ws.close()
+            await websocket.close()
         except Exception:
             pass
 
+        logging.info(f"🔚 /media websocket closed for streamSid={stream_sid}")
 
-# -----------------------------------------------------------------------------
-# Health check
-# -----------------------------------------------------------------------------
-@app.get("/health")
-def health():
-    return JSONResponse({"ok": True, "realtime_model": REALTIME_MODEL})
+
+###############################################################################
+# 4. LOCAL DEV ENTRYPOINT (OPTIONAL)
+#
+# Render will IGNORE this because you told Render to run uvicorn directly:
+#   uvicorn app:app --host 0.0.0.0 --port $PORT
+#
+# But this lets you run locally with:
+#   python app.py
+###############################################################################
+
+if __name__ == "__main__":
+    # Use PORT env if present (Render sets this), else default to 10000
+    import uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
