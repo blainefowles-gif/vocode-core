@@ -1,8 +1,7 @@
 # app.py — Riteway AI Voice Agent (Twilio <-> OpenAI Realtime)
-# Requirements:
-#   - Render env var: OPENAI_API_KEY
-#   - (optional) REALTIME_MODEL (default: gpt-4o-realtime-preview)
-#   - (optional) FORCE_PCM_CONVERT="1" to force PCM->μ-law conversion if you still hear silence
+# Assumes:
+#   - Env var OPENAI_API_KEY set in Render
+#   - (optional) REALTIME_MODEL (default gpt-4o-realtime-preview)
 # Start command (Render): uvicorn app:app --host 0.0.0.0 --port $PORT
 
 import os
@@ -28,7 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 1) Twilio webhook: return TwiML that opens a BIDIRECTIONAL stream to /media ---
+# --- 1) Twilio webhook: open a BIDIRECTIONAL stream to /media ---
 @app.post("/voice", response_class=PlainTextResponse)
 async def voice(_: Request):
     twiml = """<?xml version="1.0" encoding="UTF-8"?>
@@ -52,11 +51,10 @@ async def media(ws: WebSocket):
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "OpenAI-Beta": "realtime=v1",  # enables Realtime WS
+        "OpenAI-Beta": "realtime=v1",
     }
 
     async with aiohttp.ClientSession() as session:
-        # Connect to OpenAI Realtime WS
         async with session.ws_connect(
             f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}",
             headers=headers,
@@ -64,7 +62,7 @@ async def media(ws: WebSocket):
             heartbeat=20,
             timeout=0,
         ) as oai_ws:
-            # Configure audio I/O formats ONCE (CRITICAL)
+            # Configure audio formats ONCE (Twilio uses μ-law 8k)
             await oai_ws.send_json({
                 "type": "session.update",
                 "session": {
@@ -75,83 +73,94 @@ async def media(ws: WebSocket):
                         "material, quantity (yards/tons), and preferred delivery window. If unsure on pricing, "
                         "give a range and say you will text a confirmed quote."
                     ),
-                    # Twilio uses 8k μ-law (G.711)
                     "input_audio_format":  {"type": "g711_ulaw", "sample_rate_hz": 8000},
                     "output_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
                     "voice": "alloy"
                 }
             })
 
-            # Initial greeting (kept, per your request)
+            # Initial greeting (kept per your request)
             await oai_ws.send_json({
                 "type": "response.create",
                 "response": {"instructions": "Hi! This is Riteway. How can I help you today?"}
             })
 
-            # ---------- Twilio -> OpenAI (batch ~100ms before commit) ----------
-            async def twilio_to_openai():
-                # Twilio typically sends ~20ms per "media" frame; gather 5 frames ≈ 100ms
-                frames_since_commit = 0
+            # ------------- Twilio -> OpenAI (producer) -------------
+            # We will *not* commit here. We only append frames and count them.
+            frames_buffered = 0
+            producer_running = True
 
+            async def twilio_to_openai():
+                nonlocal frames_buffered, producer_running
                 async for message in ws.iter_text():
                     data = json.loads(message)
                     event = data.get("event")
 
-                    if event == "media":
-                        # Base64 μ-law 8k from Twilio
-                        audio_b64 = data["media"]["payload"]
+                    if event == "start":
+                        # stream started
+                        continue
 
-                        # Append ONLY (do not include 'audio_format' here)
+                    if event == "media":
+                        audio_b64 = data["media"]["payload"]
+                        # Append ONLY (no audio_format field here)
                         await oai_ws.send_json({
                             "type": "input_audio_buffer.append",
                             "audio": audio_b64
                         })
-                        frames_since_commit += 1
+                        frames_buffered += 1
+                        if frames_buffered % 3 == 0:
+                            print(f"frames buffered: {frames_buffered}")
 
-                        # Commit after ~100ms of audio
-                        if frames_since_commit >= 5:
+                    elif event == "stop":
+                        # mark producer as done
+                        producer_running = False
+                        break
+
+            # ------------- Timer task: commit every ~120ms if we have audio -------------
+            async def commit_timer():
+                nonlocal frames_buffered, producer_running
+                try:
+                    while producer_running:
+                        await asyncio.sleep(0.12)  # ~120 ms
+                        if frames_buffered > 0:
+                            print(f"COMMIT ({frames_buffered} frames)")
                             await oai_ws.send_json({"type": "input_audio_buffer.commit"})
                             await oai_ws.send_json({
                                 "type": "response.create",
                                 "response": {"instructions": ""}
                             })
-                            frames_since_commit = 0
+                            frames_buffered = 0
+                except Exception as e:
+                    print("commit_timer error:", e)
 
-                    elif event == "stop":
-                        # Flush any remaining audio
-                        if frames_since_commit > 0:
-                            try:
-                                await oai_ws.send_json({"type": "input_audio_buffer.commit"})
-                                await oai_ws.send_json({
-                                    "type": "response.create",
-                                    "response": {"instructions": ""}
-                                })
-                            except Exception as e:
-                                print("Flush error:", e)
-                        break
+                # Final flush at the very end if anything is left
+                if frames_buffered > 0:
+                    print(f"FINAL COMMIT ({frames_buffered} frames)")
+                    try:
+                        await oai_ws.send_json({"type": "input_audio_buffer.commit"})
+                        await oai_ws.send_json({
+                            "type": "response.create",
+                            "response": {"instructions": ""}
+                        })
+                    except Exception as e:
+                        print("final flush error:", e)
+                    frames_buffered = 0
 
-            # ---------- OpenAI -> Twilio (stream audio back; fallback converter available) ----------
+            # ------------- OpenAI -> Twilio (consumer) -------------
             def to_mulaw_8k_b64(delta_b64: str) -> str:
                 """
-                Convert PCM16@24k (if that's what the model sent) to μ-law@8k.
-                If FORCE_PCM_CONVERT is False, just passthrough (expects μ-law@8k already).
-                Toggle FORCE_PCM_CONVERT=1 in Render env if you still hear silence.
+                If FORCE_PCM_CONVERT=1, convert incoming PCM16@24k -> μ-law@8k.
+                Otherwise, passthrough (assumes μ-law@8k already per session.update).
                 """
                 if not FORCE_PCM_CONVERT:
-                    # Assume it's already μ-law@8k (per session.update)
                     return delta_b64
-
-                # Forced conversion path: treat incoming as PCM16@24k mono
                 try:
-                    pcm_bytes = base64.b64decode(delta_b64)  # 16-bit PCM little-endian @ 24k
-                    # Downsample 24k -> 8k
+                    pcm_bytes = base64.b64decode(delta_b64)  # assume PCM16@24k
                     pcm16_8k, _ = audioop.ratecv(pcm_bytes, 2, 1, 24000, 8000, None)
-                    # Convert linear PCM16 -> μ-law
                     mulaw_8k = audioop.lin2ulaw(pcm16_8k, 2)
                     return base64.b64encode(mulaw_8k).decode("ascii")
                 except Exception as e:
                     print("Fallback conversion failed:", e)
-                    # As a last resort, pass through
                     return delta_b64
 
             async def openai_to_twilio():
@@ -161,7 +170,6 @@ async def media(ws: WebSocket):
                         typ = payload.get("type", "")
                         print("OAI event:", typ)
 
-                        # Realtime audio stream from OpenAI
                         if typ == "response.audio.delta":
                             chunk_b64 = payload.get("delta")
                             if chunk_b64:
@@ -171,8 +179,8 @@ async def media(ws: WebSocket):
                                     "media": {"payload": safe_chunk_b64}
                                 })
 
-                        elif typ == "response.audio.done":
-                            # End of assistant turn
+                        elif typ in ("response.done", "response.completed", "response.audio.done"):
+                            # end of an assistant turn
                             pass
 
                         elif typ == "error":
@@ -182,7 +190,11 @@ async def media(ws: WebSocket):
                         break
 
             try:
-                await asyncio.gather(twilio_to_openai(), openai_to_twilio())
+                await asyncio.gather(
+                    twilio_to_openai(),
+                    commit_timer(),
+                    openai_to_twilio()
+                )
             except WebSocketDisconnect:
                 print("❌ Twilio websocket disconnected")
             finally:
