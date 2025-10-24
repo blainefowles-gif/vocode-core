@@ -36,7 +36,7 @@ app.add_middleware(
 )
 
 ###############################################################################
-# AUDIO HELPERS
+# AUDIO HELPERS (kept minimal; Twilio rings happen via TwiML before streaming)
 ###############################################################################
 
 def pcm16_to_ulaw(pcm16: np.ndarray) -> bytes:
@@ -64,43 +64,6 @@ def pcm16_to_ulaw(pcm16: np.ndarray) -> bytes:
         out.append(ulaw_byte)
     return bytes(out)
 
-def generate_beep_ulaw_chunks(duration_sec=0.8, freq_hz=440.0, sample_rate=8000):
-    """
-    Safety tone, in case we ever need to send audio while AI is booting.
-    We won't actively play this now unless something is badly wrong.
-    """
-    total_samples = int(duration_sec * sample_rate)
-    t = np.arange(total_samples) / sample_rate
-    pcm16 = (10000 * np.sin(2 * math.pi * freq_hz * t)).astype(np.int16)
-    ulaw_bytes = pcm16_to_ulaw(pcm16)
-
-    frame_size = 160  # 20ms @ 8kHz
-    chunks_b64 = []
-    for i in range(0, len(ulaw_bytes), frame_size):
-        frame = ulaw_bytes[i:i+frame_size]
-        if not frame:
-            continue
-        b64_payload = base64.b64encode(frame).decode("ascii")
-        chunks_b64.append(b64_payload)
-
-    return chunks_b64
-
-async def send_ulaw_chunks_to_twilio(ws: WebSocket, stream_sid: str, chunks_b64: list):
-    """
-    Send pre-encoded μ-law 20ms frames to Twilio with ~20ms pacing.
-    """
-    logging.info(f"🔊 sending {len(chunks_b64)} fallback frames to Twilio (sid={stream_sid})")
-    for frame_b64 in chunks_b64:
-        await ws.send_json({
-            "event": "media",
-            "streamSid": stream_sid,
-            "media": {
-                "payload": frame_b64
-            }
-        })
-        await asyncio.sleep(0.02)
-    logging.info("🔊 finished sending fallback frames")
-
 ###############################################################################
 # ROUTES
 ###############################################################################
@@ -116,14 +79,17 @@ async def health():
 @app.post("/voice", response_class=PlainTextResponse)
 async def voice(_: Request):
     """
-    Twilio calls this first.
-    We return TwiML that IMMEDIATELY starts streaming the call audio
-    to our /media WebSocket. We REMOVED the Twilio <Say> so callers
-    do NOT hear 'Connecting you...' first.
+    Twilio hits this first.
+    We add two short 'ring' beats to give OpenAI time to spin up,
+    then start streaming to /media.
     """
     logging.info("☎ Twilio hit /voice")
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Say voice="alice">ring</Say>
+  <Pause length="1"/>
+  <Say voice="alice">ring</Say>
+  <Pause length="0.5"/>
   <Connect>
     <Stream url="{WS_MEDIA_URL}" />
   </Connect>
