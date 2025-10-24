@@ -64,10 +64,10 @@ def pcm16_to_ulaw(pcm16: np.ndarray) -> bytes:
         out.append(ulaw_byte)
     return bytes(out)
 
-def generate_beep_ulaw_chunks(duration_sec=1.0, freq_hz=440.0, sample_rate=8000):
+def generate_beep_ulaw_chunks(duration_sec=0.8, freq_hz=440.0, sample_rate=8000):
     """
-    Make a short 'beep' in μ-law sliced into 20ms frames and base64 encode.
-    We use this as a sanity check / filler so Twilio doesn't think we're dead.
+    Safety tone, in case we ever need to send audio while AI is booting.
+    We won't actively play this now unless something is badly wrong.
     """
     total_samples = int(duration_sec * sample_rate)
     t = np.arange(total_samples) / sample_rate
@@ -89,7 +89,7 @@ async def send_ulaw_chunks_to_twilio(ws: WebSocket, stream_sid: str, chunks_b64:
     """
     Send pre-encoded μ-law 20ms frames to Twilio with ~20ms pacing.
     """
-    logging.info(f"🔊 sending {len(chunks_b64)} fallback beep frames to Twilio (sid={stream_sid})")
+    logging.info(f"🔊 sending {len(chunks_b64)} fallback frames to Twilio (sid={stream_sid})")
     for frame_b64 in chunks_b64:
         await ws.send_json({
             "event": "media",
@@ -99,7 +99,7 @@ async def send_ulaw_chunks_to_twilio(ws: WebSocket, stream_sid: str, chunks_b64:
             }
         })
         await asyncio.sleep(0.02)
-    logging.info("🔊 finished sending fallback beep frames")
+    logging.info("🔊 finished sending fallback frames")
 
 ###############################################################################
 # ROUTES
@@ -116,14 +116,14 @@ async def health():
 @app.post("/voice", response_class=PlainTextResponse)
 async def voice(_: Request):
     """
-    Twilio calls this first. We respond with TwiML telling Twilio:
-    1. Say something to the caller
-    2. Start streaming the live call audio to /media over WebSocket
+    Twilio calls this first.
+    We return TwiML that IMMEDIATELY starts streaming the call audio
+    to our /media WebSocket. We REMOVED the Twilio <Say> so callers
+    do NOT hear 'Connecting you...' first.
     """
     logging.info("☎ Twilio hit /voice")
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">Connecting you to the Riteway assistant.</Say>
   <Connect>
     <Stream url="{WS_MEDIA_URL}" />
   </Connect>
@@ -133,9 +133,8 @@ async def voice(_: Request):
 @app.websocket("/media")
 async def media(ws: WebSocket):
     """
-    This is the live audio bridge during a phone call.
-
-    Twilio <-> (this server) <-> OpenAI Realtime
+    Live call bridge:
+      Twilio <-> (this server) <-> OpenAI Realtime Voice API
     """
     await ws.accept()
     logging.info("✅ Twilio connected to /media")
@@ -144,7 +143,7 @@ async def media(ws: WebSocket):
     openai_connected = False
     oai_ws_handle = None
 
-    # Queue of μ-law frames from OpenAI that we drip back to Twilio.
+    # μ-law audio chunks from OpenAI waiting to go back to Twilio
     playback_queue = deque()
     playback_running = True
     playback_task = None
@@ -154,22 +153,12 @@ async def media(ws: WebSocket):
     else:
         logging.info("🔑 OPENAI_API_KEY is present")
 
-    async def play_fallback_beep_once():
-        """
-        Play a short beep to prove Twilio can hear *something*
-        if OpenAI isn't ready yet. Helps avoid silence.
-        """
-        if not stream_sid:
-            return
-        chunks = generate_beep_ulaw_chunks(duration_sec=1.0, freq_hz=440.0)
-        await send_ulaw_chunks_to_twilio(ws, stream_sid, chunks)
-
     async def playback_loop():
         """
-        Pull μ-law audio frames from playback_queue
-        and send them to Twilio every ~20ms.
+        Take μ-law frames from playback_queue and drip them to Twilio
+        every ~20ms so the caller hears smooth audio.
         """
-        await asyncio.sleep(0.1)  # tiny delay so Twilio is fully ready
+        await asyncio.sleep(0.1)  # small delay so Twilio is fully ready
         nonlocal playback_running
         while playback_running:
             if playback_queue and stream_sid:
@@ -179,15 +168,15 @@ async def media(ws: WebSocket):
                     "streamSid": stream_sid,
                     "media": {"payload": frame_b64},
                 })
-                await asyncio.sleep(0.02)  # ~20ms pacing
+                await asyncio.sleep(0.02)  # ~20ms per 160-byte μ-law frame
             else:
                 await asyncio.sleep(0.005)
 
     async def forward_twilio_to_openai(oai_ws):
         """
-        1. Receive caller audio from Twilio ("media" events).
-        2. Convert Twilio μ-law 8k -> PCM16 24k.
-        3. Send that audio into OpenAI Realtime using input_audio_buffer.append.
+        1. Read incoming 'media' events from Twilio = caller's voice.
+        2. Convert μ-law 8kHz -> PCM16 24kHz.
+        3. Send audio to OpenAI as input_audio_buffer.append.
         """
         nonlocal stream_sid
         nonlocal openai_connected
@@ -218,23 +207,18 @@ async def media(ws: WebSocket):
                 call_sid = data["start"].get("callSid")
                 logging.info(f"📞 Twilio start: streamSid={stream_sid} callSid={call_sid}")
 
-                # If OpenAI isn't ready yet, play the beep so caller hears *something*
-                if not openai_connected:
-                    logging.warning("⚠ OpenAI not connected yet. Playing fallback beep.")
-                    await play_fallback_beep_once()
-
             elif event == "media":
-                # Caller audio chunk from Twilio
+                # Caller audio chunk
                 payload_b64 = data["media"]["payload"]
                 ulaw_bytes = base64.b64decode(payload_b64)
 
-                # μ-law 8kHz -> PCM16 16-bit
+                # μ-law -> PCM16 @8kHz
                 pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)
 
-                # resample 8k -> 24k because we feed 24k PCM16 to OpenAI
+                # upsample 8k -> 24k (OpenAI expects 24k PCM16)
                 pcm16_24k, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 24000, None)
 
-                # send to OpenAI if connected
+                # forward to OpenAI
                 if oai_ws and openai_connected:
                     try:
                         b64_for_openai = base64.b64encode(pcm16_24k).decode("ascii")
@@ -256,14 +240,12 @@ async def media(ws: WebSocket):
 
     async def forward_openai_to_twilio(oai_ws):
         """
-        Read events from OpenAI.
-        For each 'response.audio.delta', we get μ-law audio and queue it
-        for playback_loop() to drip to Twilio.
+        Read streamed events from OpenAI.
+        On response.audio.delta -> push μ-law chunk to playback_queue.
         """
         nonlocal openai_connected
         try:
             async for raw in oai_ws:
-                # We mostly care about TEXT frames from OpenAI WS
                 if raw.type != aiohttp.WSMsgType.TEXT:
                     continue
 
@@ -274,10 +256,9 @@ async def media(ws: WebSocket):
                 openai_connected = True  # we heard from OpenAI
 
                 if oai_type == "response.audio.delta":
-                    # base64-encoded μ-law audio chunk from OpenAI
-                    audio_chunk_b64 = data.get("delta")
-                    if audio_chunk_b64:
-                        playback_queue.append(audio_chunk_b64)
+                    ulaw_chunk_b64 = data.get("delta")
+                    if ulaw_chunk_b64:
+                        playback_queue.append(ulaw_chunk_b64)
 
                 elif oai_type == "response.completed":
                     logging.info("✅ AI finished a spoken response")
@@ -289,7 +270,7 @@ async def media(ws: WebSocket):
             logging.exception("💥 Error while reading from OpenAI ws (forward_openai_to_twilio)")
         logging.info("🚪 forward_openai_to_twilio exiting")
 
-    # MAIN CONNECT TO OPENAI REALTIME
+    # MAIN: connect to OpenAI Realtime
     if not OPENAI_API_KEY:
         logging.error("❌ OPENAI_API_KEY missing. Skipping OpenAI connect.")
         await forward_twilio_to_openai(None)
@@ -309,7 +290,7 @@ async def media(ws: WebSocket):
                 openai_connected = True
                 oai_ws_handle = oai_ws
 
-                # Tell OpenAI how to behave in this call
+                # Tell OpenAI how to act on this call
                 await oai_ws.send_json({
                     "type": "session.update",
                     "session": {
@@ -324,35 +305,40 @@ async def media(ws: WebSocket):
                             "create_response": True
                         },
                         "instructions": (
-                            "You are Riteway Landscape Supply's live phone assistant.\n\n"
-                            "ABOUT THE BUSINESS:\n"
-                            "- Business name: Riteway Landscape Supply.\n"
-                            "- We supply bulk landscape material (rock, dirt, bark, sand) by the yard.\n"
-                            "- We are open Monday through Friday, 9 AM to 5 PM. No after-hours or weekend scheduling.\n"
-                            "- We primarily serve the Tooele Valley and surrounding areas.\n"
-                            "- Most callers already know what product they want and how many yards.\n\n"
-                            "PRODUCTS AND PRICING (price per yard unless noted):\n"
-                            "ROCK:\n"
-                            "- Washed Pea Gravel – $42.00 per yard\n"
-                            "- Desert Sun 7/8\" Crushed Rock – $40.00 per yard\n"
-                            "- 7/8\" Crushed Rock – $25.00 per yard\n"
-                            "- Desert Sun 1.5\" Crushed Rock – $40.00 per yard\n"
-                            "- 1.5\" Crushed Rock – $25.00 per yard\n"
-                            "- Commercial Road Base – $20.00 per yard\n"
-                            "- 3/8\" Minus Fines – $12.00 per yard\n"
-                            "- Desert Sun 1–3\" Cobble – $40.00 per yard\n"
-                            "- 8\" Landscape Cobble – $40.00 per yard\n"
-                            "- Desert Sun Boulders – $75.00 per ton (NOT per yard)\n\n"
-                            "DIRT / SOIL / SAND:\n"
-                            "- Fill Dirt – $12.00 per yard\n"
-                            "- Top Soil – $26.00 per yard\n"
-                            "- Screened Premium Top Soil – $40.00 per yard\n"
-                            "- Washed Sand – $65.00 per yard\n\n"
-                            "BARK / MULCH:\n"
-                            "- Premium Mulch – $44.00 per yard\n"
-                            "- Colored Shredded Bark – $76.00 per yard\n\n"
-                            "DELIVERY / TRUCK INFO:\n"
-                            "- We can haul up to 16 yards per load. If someone needs more than 16 yards, that is multiple loads.\n"
+                            "You are the live phone receptionist for Riteway Landscape Supply.\n\n"
+                            "TONE:\n"
+                            "- Speak warm, professional, confident, and efficient.\n"
+                            "- Sound like a real dispatcher at a busy landscape yard.\n"
+                            "- Be friendly and helpful, but also direct and firm.\n"
+                            "- Keep each answer under 30 seconds.\n\n"
+                            "BUSINESS INFO:\n"
+                            "- Business: Riteway Landscape Supply.\n"
+                            "- We sell bulk landscape material by the cubic yard.\n"
+                            "- We are open Monday–Friday, 9 AM to 5 PM. No after-hours or weekend scheduling.\n"
+                            "- We mainly serve Tooele Valley and surrounding areas.\n"
+                            "- Most callers already know which product they want and how many yards.\n\n"
+                            "PRICING (ALWAYS say 'per yard' or 'per ton'):\n"
+                            "ROCK (price per yard unless noted):\n"
+                            "- Washed Pea Gravel: $42 per yard.\n"
+                            "- Desert Sun 7/8\" Crushed Rock: $40 per yard.\n"
+                            "- 7/8\" Crushed Rock: $25 per yard.\n"
+                            "- Desert Sun 1.5\" Crushed Rock: $40 per yard.\n"
+                            "- 1.5\" Crushed Rock: $25 per yard.\n"
+                            "- Commercial Road Base: $20 per yard.\n"
+                            "- 3/8\" Minus Fines: $12 per yard.\n"
+                            "- Desert Sun 1–3\" Cobble: $40 per yard.\n"
+                            "- 8\" Landscape Cobble: $40 per yard.\n"
+                            "- Desert Sun Boulders: $75 per ton (not per yard).\n\n"
+                            "DIRT / SOIL / SAND (price per yard):\n"
+                            "- Fill Dirt: $12 per yard.\n"
+                            "- Top Soil: $26 per yard.\n"
+                            "- Screened Premium Top Soil: $40 per yard.\n"
+                            "- Washed Sand: $65 per yard.\n\n"
+                            "BARK / MULCH (price per yard):\n"
+                            "- Premium Mulch: $44 per yard.\n"
+                            "- Colored Shredded Bark: $76 per yard.\n\n"
+                            "DELIVERY RULES:\n"
+                            "- We can haul up to 16 yards per load. If they need more than 16 yards, that's multiple loads.\n"
                             "- Delivery pricing inside Tooele Valley:\n"
                             "  - $75 delivery fee to Grantsville.\n"
                             "  - $115 delivery fee to the rest of Tooele Valley (Tooele, Stansbury, etc.).\n"
@@ -360,32 +346,42 @@ async def media(ws: WebSocket):
                             "  1. Ask for the full delivery address.\n"
                             "  2. Repeat the address back and confirm it's correct.\n"
                             "  3. Tell them: 'We charge $7 per mile from our yard in Grantsville, Utah.'\n"
-                            "  4. Say: 'We'll confirm the exact total when dispatch calls you back.'\n\n"
-                            "HOW TO BOOK A DELIVERY:\n"
-                            "If the caller wants to place an order or schedule a delivery, do this:\n"
-                            "1. Ask what material they want.\n"
-                            "2. Ask how many yards they want (remind them we haul up to 16 yards per load).\n"
-                            "3. Ask for the full delivery address.\n"
-                            "4. Ask when they would like it delivered.\n"
-                            "5. Ask for their name and callback number.\n"
-                            "6. If they are in Tooele Valley, tell them the delivery fee ($75 Grantsville, $115 rest of Tooele Valley).\n"
-                            "7. If they are outside Tooele Valley, explain the $7/mile from Grantsville and say we'll confirm final pricing.\n"
-                            "8. Tell them: 'We'll confirm timing and reach back out to lock this in.'\n\n"
-                            "WHAT NOT TO DO:\n"
-                            "- Do NOT promise an exact delivery time window. Say: 'We'll confirm timing with dispatch.'\n"
-                            "- Do NOT offer after-hours or weekend service. We are Monday–Friday 9 AM to 5 PM.\n"
-                            "- Do NOT invent products or prices that are not listed above.\n"
-                            "- If you're not sure or they ask something unusual, take their info and say someone will call them back.\n\n"
-                            "TONE / STYLE:\n"
-                            "- Be fast, polite, confident, and friendly.\n"
-                            "- Keep each response short, under 30 seconds.\n"
-                            "- Most callers just want price and delivery. Answer directly.\n"
-                            "- If they are ready to schedule, collect details so we can actually deliver.\n"
+                            "  4. Say: 'We'll confirm the final total when dispatch calls you back.'\n\n"
+                            "BOOKING / TAKING AN ORDER:\n"
+                            "If they want to schedule a delivery or place an order, gather:\n"
+                            "1. Material they want.\n"
+                            "2. How many yards they want (remind them: up to 16 yards per load).\n"
+                            "3. Delivery address.\n"
+                            "4. When they want it delivered.\n"
+                            "5. Their name and callback number.\n"
+                            "After you get that info, tell them: 'We'll confirm timing and reach back out to lock this in.'\n\n"
+                            "COVERAGE / YARDAGE ESTIMATES:\n"
+                            "- One cubic yard of material covers roughly 100 square feet at about 3 inches deep. Use that as a rule of thumb if they ask.\n"
+                            "- You can also help them estimate yards needed from dimensions.\n"
+                            "- To estimate yards needed:\n"
+                            "  1. Ask for length in feet.\n"
+                            "  2. Ask for width in feet.\n"
+                            "  3. Ask for depth in inches.\n"
+                            "  4. Compute: yards_needed = (length_ft * width_ft * depth_inches / 12) / 27.\n"
+                            "     - Explanation: length * width = square feet. depth_inches/12 = depth in feet.\n"
+                            "       Multiply to get cubic feet, then divide by 27 to get cubic yards.\n"
+                            "  5. Round to one decimal place and tell them: 'You need about X yards. We can haul up to 16 yards per load.'\n"
+                            "  6. After estimating, offer delivery.\n\n"
+                            "POLICY / WHAT NOT TO DO:\n"
+                            "- Do NOT promise exact arrival times. Say: 'We'll confirm the delivery window with dispatch.'\n"
+                            "- Do NOT offer after-hours or weekend service. We are Monday–Friday, 9 AM to 5 PM.\n"
+                            "- Do NOT invent products or prices.\n"
+                            "- If you're not sure, or it sounds unusual, collect their info and say someone will call them back.\n\n"
+                            "CALL FLOW / HOW YOU TALK:\n"
+                            "- First line when the call starts should be: 'Hi, this is Riteway Landscape Supply. How can I help you today?'\n"
+                            "- Answer pricing questions clearly using 'per yard' or 'per ton'.\n"
+                            "- If they sound ready to order, move immediately into collecting delivery details.\n"
+                            "- Stay calm, helpful, and decisive.\n"
                         )
                     }
                 })
 
-                # Send initial spoken greeting
+                # First spoken line the caller hears (our greeting, warm + professional)
                 await oai_ws.send_json({
                     "type": "response.create",
                     "response": {
@@ -393,10 +389,10 @@ async def media(ws: WebSocket):
                     }
                 })
 
-                # Start the audio-out pacing loop
+                # Start the playback loop to drip audio back to Twilio
                 playback_task = asyncio.create_task(playback_loop())
 
-                # Run both pipelines at once:
+                # Run both pipelines (Twilio->OpenAI and OpenAI->Twilio) at the same time
                 await asyncio.gather(
                     forward_twilio_to_openai(oai_ws_handle),
                     forward_openai_to_twilio(oai_ws_handle),
@@ -405,9 +401,9 @@ async def media(ws: WebSocket):
         except Exception:
             logging.exception(
                 "❌ Failed to connect to OpenAI Realtime! "
-                "Common causes: bad/expired OPENAI_API_KEY or model access."
+                "Possible causes: invalid OPENAI_API_KEY or missing model access."
             )
-            # if OpenAI failed completely, still drain Twilio so call ends cleanly
+            # If OpenAI dies, still drain Twilio events so call ends clean
             await forward_twilio_to_openai(None)
 
     # Cleanup playback loop
@@ -418,7 +414,7 @@ async def media(ws: WebSocket):
 
     logging.info("🔚 /media connection closed")
 
-# local dev entrypoint (Render uses uvicorn directly so this is mostly backup)
+# local dev entrypoint (Render normally calls uvicorn directly)
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
