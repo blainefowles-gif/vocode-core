@@ -7,6 +7,7 @@ import logging
 import audioop
 import numpy as np
 import aiohttp
+from collections import deque
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -84,6 +85,7 @@ async def send_ulaw_chunks_to_twilio(ws: WebSocket, stream_sid: str, chunks_b64:
                 "payload": frame_b64
             }
         })
+        # pace ~20ms per frame
         await asyncio.sleep(0.02)
     logging.info("🔊 finished sending fallback beep frames")
 
@@ -120,6 +122,11 @@ async def media(ws: WebSocket):
     openai_connected = False
     oai_ws_handle = None
 
+    # queue of audio chunks from OpenAI waiting to send to Twilio
+    playback_queue = deque()
+    playback_task = None
+    playback_running = True
+
     if not OPENAI_API_KEY:
         logging.error("❌ No OPENAI_API_KEY in environment.")
     else:
@@ -135,6 +142,26 @@ async def media(ws: WebSocket):
             return
         chunks = generate_beep_ulaw_chunks(duration_sec=1.0, freq_hz=440.0)
         await send_ulaw_chunks_to_twilio(ws, stream_sid, chunks)
+
+    async def playback_loop():
+        """
+        Take audio chunks from playback_queue and drip them to Twilio
+        every ~20ms so Twilio hears clear speech instead of static.
+        """
+        nonlocal playback_running
+        while playback_running:
+            if playback_queue and stream_sid:
+                frame_b64 = playback_queue.popleft()
+                await ws.send_json({
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {"payload": frame_b64},
+                })
+                # pace it so Twilio plays smoothly
+                await asyncio.sleep(0.02)
+            else:
+                # nothing to play right now
+                await asyncio.sleep(0.005)
 
     async def forward_twilio_to_openai(oai_ws):
         nonlocal stream_sid
@@ -158,7 +185,11 @@ async def media(ws: WebSocket):
 
             event = data.get("event")
 
-            if event == "start":
+            if event == "connected":
+                # Twilio sometimes sends this first now
+                logging.info(f"ℹ Twilio event connected: {data}")
+
+            elif event == "start":
                 stream_sid = data["start"]["streamSid"]
                 call_sid = data["start"].get("callSid")
                 logging.info(f"📞 Twilio start: streamSid={stream_sid} callSid={call_sid}")
@@ -171,7 +202,10 @@ async def media(ws: WebSocket):
                 payload_b64 = data["media"]["payload"]
                 ulaw_bytes = base64.b64decode(payload_b64)
 
+                # Twilio -> PCM16 8kHz
                 pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)
+
+                # Resample 8kHz -> 24kHz
                 pcm16_24k, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 24000, None)
 
                 if oai_ws and openai_connected:
@@ -194,6 +228,11 @@ async def media(ws: WebSocket):
         logging.info("🚪 forward_twilio_to_openai exiting")
 
     async def forward_openai_to_twilio(oai_ws):
+        """
+        Read events from OpenAI.
+        Push audio chunks into playback_queue.
+        playback_loop() will drip them back to Twilio in real time.
+        """
         nonlocal openai_connected
         try:
             async for raw in oai_ws:
@@ -207,12 +246,8 @@ async def media(ws: WebSocket):
 
                 if oai_type == "response.audio.delta":
                     audio_chunk_b64 = data.get("delta")
-                    if audio_chunk_b64 and stream_sid:
-                        await ws.send_json({
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": audio_chunk_b64},
-                        })
+                    if audio_chunk_b64:
+                        playback_queue.append(audio_chunk_b64)
 
                 elif oai_type == "response.completed":
                     logging.info("✅ AI finished a spoken response")
@@ -227,6 +262,7 @@ async def media(ws: WebSocket):
     # main OpenAI connect
     if not OPENAI_API_KEY:
         logging.error("❌ OPENAI_API_KEY missing. Skipping OpenAI connect.")
+        # even without OpenAI we still run forward_twilio_to_openai to keep call alive
         await forward_twilio_to_openai(None)
         logging.info("🔚 /media connection closed (no OpenAI)")
         return
@@ -235,17 +271,21 @@ async def media(ws: WebSocket):
         try:
             async with session.ws_connect(
                 f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}",
-                headers=headers,
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "OpenAI-Beta": "realtime=v1",
+                },
             ) as oai_ws:
                 logging.info("✅ Connected to OpenAI Realtime successfully!")
 
-                oai_ws_handle = oai_ws
                 openai_connected = True
+                oai_ws_handle = oai_ws
 
+                # FIX 1: update modalities to include "text" too
                 await oai_ws.send_json({
                     "type": "session.update",
                     "session": {
-                        "modalities": ["audio"],
+                        "modalities": ["audio", "text"],
                         "input_audio_format": {
                             "type": "pcm16",
                             "sample_rate_hz": 24000
@@ -269,6 +309,7 @@ async def media(ws: WebSocket):
                     }
                 })
 
+                # Kick off greeting
                 await oai_ws.send_json({
                     "type": "response.create",
                     "response": {
@@ -276,6 +317,10 @@ async def media(ws: WebSocket):
                     }
                 })
 
+                # start playback loop in background
+                playback_task = asyncio.create_task(playback_loop())
+
+                # run Twilio->OpenAI and OpenAI->Twilio in parallel
                 await asyncio.gather(
                     forward_twilio_to_openai(oai_ws_handle),
                     forward_openai_to_twilio(oai_ws_handle),
@@ -287,8 +332,14 @@ async def media(ws: WebSocket):
                 "Most common causes: (1) bad/expired OPENAI_API_KEY, "
                 "(2) account not allowed to use gpt-4o-realtime-preview yet."
             )
-
+            # still let Twilio talk a little / hear beep
             await forward_twilio_to_openai(None)
+
+    # clean up playback loop
+    playback_running = False
+    if playback_task:
+        await asyncio.sleep(0.1)
+        playback_task.cancel()
 
     logging.info("🔚 /media connection closed")
 
