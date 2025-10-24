@@ -91,30 +91,54 @@ async def media(ws: WebSocket):
             })
 
             # ---------- Twilio -> OpenAI ----------
-            async def twilio_to_openai():
-                async for message in ws.iter_text():
-                    data = json.loads(message)
-                    event = data.get("event")
+            # ---------- Twilio -> OpenAI (batch frames before commit + keep greeting) ----------
+async def twilio_to_openai():
+    # Send initial greeting immediately after connection
+    await oai_ws.send_json({
+        "type": "response.create",
+        "response": {"instructions": "Hi! This is Riteway. How can I help you today?"}
+    })
 
-                    if event == "media":
-                        # Twilio sends μ-law 8k audio as base64
-                        audio_b64 = data["media"]["payload"]
-                        # DO NOT send audio_format here (that caused your error)
-                        await oai_ws.send_json({
-                            "type": "input_audio_buffer.append",
-                            "audio": audio_b64
-                        })
-                        # Commit often so the model responds quickly
-                        await oai_ws.send_json({"type": "input_audio_buffer.commit"})
-                        await oai_ws.send_json({"type": "response.create", "response": {"instructions": ""}})
+    # Twilio usually sends 20ms per frame, so wait ~5 frames before committing (≈100ms)
+    frames_since_commit = 0
 
-                    elif event == "stop":
-                        try:
-                            await oai_ws.send_json({"type": "input_audio_buffer.commit"})
-                            await oai_ws.send_json({"type": "response.create", "response": {"instructions": ""}})
-                        except Exception:
-                            pass
-                        break
+    async for message in ws.iter_text():
+        data = json.loads(message)
+        event = data.get("event")
+
+        if event == "media":
+            audio_b64 = data["media"]["payload"]
+
+            # Append audio to OpenAI’s buffer (no audio_format here!)
+            await oai_ws.send_json({
+                "type": "input_audio_buffer.append",
+                "audio": audio_b64
+            })
+
+            frames_since_commit += 1
+
+            # Only commit once ~100ms of audio has been received
+            if frames_since_commit >= 5:
+                await oai_ws.send_json({"type": "input_audio_buffer.commit"})
+                await oai_ws.send_json({
+                    "type": "response.create",
+                    "response": {"instructions": ""}
+                })
+                frames_since_commit = 0
+
+        elif event == "stop":
+            # If call ended but there’s uncommitted audio, flush it
+            if frames_since_commit > 0:
+                try:
+                    await oai_ws.send_json({"type": "input_audio_buffer.commit"})
+                    await oai_ws.send_json({
+                        "type": "response.create",
+                        "response": {"instructions": ""}
+                    })
+                except Exception as e:
+                    print("Flush error:", e)
+            break
+
 
             # ---------- OpenAI -> Twilio ----------
             async def openai_to_twilio():
