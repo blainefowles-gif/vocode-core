@@ -16,7 +16,6 @@ import aiohttp
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
-FORCE_PCM_CONVERT = os.getenv("FORCE_PCM_CONVERT", "0") == "1"
 
 app = FastAPI(title="Riteway AI Agent")
 
@@ -62,7 +61,7 @@ async def media(ws: WebSocket):
             heartbeat=20,
             timeout=0,
         ) as oai_ws:
-            # Configure audio formats ONCE (Twilio uses μ-law 8k)
+            # IMPORTANT: Tell OpenAI we will send PCM16 at 24 kHz, but we want μ-law 8 kHz back for Twilio.
             await oai_ws.send_json({
                 "type": "session.update",
                 "session": {
@@ -73,7 +72,9 @@ async def media(ws: WebSocket):
                         "material, quantity (yards/tons), and preferred delivery window. If unsure on pricing, "
                         "give a range and say you will text a confirmed quote."
                     ),
-                    "input_audio_format":  {"type": "g711_ulaw", "sample_rate_hz": 8000},
+                    # INPUT to OpenAI (what we send): PCM16 24kHz
+                    "input_audio_format":  {"type": "pcm16", "sample_rate_hz": 24000},
+                    # OUTPUT from OpenAI (what we need Twilio to play): μ-law 8kHz
                     "output_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
                     "voice": "alloy"
                 }
@@ -85,10 +86,17 @@ async def media(ws: WebSocket):
                 "response": {"instructions": "Hi! This is Riteway. How can I help you today?"}
             })
 
-            # ------------- Twilio -> OpenAI (producer) -------------
-            # We will *not* commit here. We only append frames and count them.
+            # ---------- Twilio -> OpenAI ----------
+            # We'll buffer frames and commit on a timer (≈120ms) so we never commit an empty buffer.
             frames_buffered = 0
             producer_running = True
+
+            def ulaw8k_b64_to_pcm16_24k_b64(ulaw_b64: str) -> str:
+                """Convert Twilio μ-law@8k (base64) -> PCM16@24k (base64) for OpenAI input."""
+                ulaw_bytes = base64.b64decode(ulaw_b64)          # μ-law 8k, 8-bit mono
+                pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)       # -> PCM16 8k, 16-bit mono
+                pcm16_24k, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 24000, None)  # upsample to 24k
+                return base64.b64encode(pcm16_24k).decode("ascii")
 
             async def twilio_to_openai():
                 nonlocal frames_buffered, producer_running
@@ -101,22 +109,24 @@ async def media(ws: WebSocket):
                         continue
 
                     if event == "media":
-                        audio_b64 = data["media"]["payload"]
-                        # Append ONLY (no audio_format field here)
+                        # Twilio sends μ-law@8k base64
+                        ulaw_b64 = data["media"]["payload"]
+                        # Convert to PCM16@24k for OpenAI
+                        pcm24_b64 = ulaw8k_b64_to_pcm16_24k_b64(ulaw_b64)
+
+                        # Append ONLY (no audio_format here)
                         await oai_ws.send_json({
                             "type": "input_audio_buffer.append",
-                            "audio": audio_b64
+                            "audio": pcm24_b64
                         })
                         frames_buffered += 1
                         if frames_buffered % 3 == 0:
                             print(f"frames buffered: {frames_buffered}")
 
                     elif event == "stop":
-                        # mark producer as done
                         producer_running = False
                         break
 
-            # ------------- Timer task: commit every ~120ms if we have audio -------------
             async def commit_timer():
                 nonlocal frames_buffered, producer_running
                 try:
@@ -133,7 +143,7 @@ async def media(ws: WebSocket):
                 except Exception as e:
                     print("commit_timer error:", e)
 
-                # Final flush at the very end if anything is left
+                # final flush
                 if frames_buffered > 0:
                     print(f"FINAL COMMIT ({frames_buffered} frames)")
                     try:
@@ -146,23 +156,7 @@ async def media(ws: WebSocket):
                         print("final flush error:", e)
                     frames_buffered = 0
 
-            # ------------- OpenAI -> Twilio (consumer) -------------
-            def to_mulaw_8k_b64(delta_b64: str) -> str:
-                """
-                If FORCE_PCM_CONVERT=1, convert incoming PCM16@24k -> μ-law@8k.
-                Otherwise, passthrough (assumes μ-law@8k already per session.update).
-                """
-                if not FORCE_PCM_CONVERT:
-                    return delta_b64
-                try:
-                    pcm_bytes = base64.b64decode(delta_b64)  # assume PCM16@24k
-                    pcm16_8k, _ = audioop.ratecv(pcm_bytes, 2, 1, 24000, 8000, None)
-                    mulaw_8k = audioop.lin2ulaw(pcm16_8k, 2)
-                    return base64.b64encode(mulaw_8k).decode("ascii")
-                except Exception as e:
-                    print("Fallback conversion failed:", e)
-                    return delta_b64
-
+            # ---------- OpenAI -> Twilio ----------
             async def openai_to_twilio():
                 async for msg in oai_ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
@@ -171,16 +165,15 @@ async def media(ws: WebSocket):
                         print("OAI event:", typ)
 
                         if typ == "response.audio.delta":
+                            # Because we requested output g711_ulaw@8k, 'delta' should already be μ-law 8k base64.
                             chunk_b64 = payload.get("delta")
                             if chunk_b64:
-                                safe_chunk_b64 = to_mulaw_8k_b64(chunk_b64)
                                 await ws.send_json({
                                     "event": "media",
-                                    "media": {"payload": safe_chunk_b64}
+                                    "media": {"payload": chunk_b64}
                                 })
 
                         elif typ in ("response.done", "response.completed", "response.audio.done"):
-                            # end of an assistant turn
                             pass
 
                         elif typ == "error":
@@ -203,4 +196,4 @@ async def media(ws: WebSocket):
 # Health check
 @app.get("/health")
 def health():
-    return {"ok": True, "realtime_model": REALTIME_MODEL, "force_pcm_convert": FORCE_PCM_CONVERT}
+    return {"ok": True, "realtime_model": REALTIME_MODEL}
