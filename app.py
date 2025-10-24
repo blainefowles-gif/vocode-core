@@ -53,30 +53,95 @@ async def media(ws: WebSocket):
         await ws.close()
         return
 
-    # Open a websocket to OpenAI Realtime
-    # (The Realtime API is full-duplex audio over WS.)
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "OpenAI-Beta": "realtime=v1",
     }
 
-    # Build an initial "session" config with a short system prompt for Riteway
-    # and request that the model returns audio (μ-law/PCMU 8k) compatible with Twilio.
-    session_update = {
-        "type": "session.update",
-        "session": {
-            "modalities": ["audio"],
-            "instructions": (
-                "You are the phone receptionist for Riteway Landscape Materials in Grantsville, Utah. "
-                "Be brief, friendly, and professional. Collect: caller name, callback number, address, "
-                "material, quantity (yards/tons), and preferred delivery window. If unsure on pricing, "
-                "give a range and say you will text a confirmed quote."
-            ),
-            # Twilio Media Streams uses 8kHz mulaw (audio/pcmu). Ask Realtime to output that.
-            "voice": "alloy",
-            "audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
-        },
-    }
+    async with aiohttp.ClientSession() as session:
+        # 1) Connect to OpenAI Realtime
+        async with session.ws_connect(
+            f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}",
+            headers=headers,
+            autoping=True,
+            heartbeat=20,
+        ) as oai_ws:
+
+            # 2) Tell OpenAI what formats we use (CRITICAL):
+            # - Twilio sends 8kHz G.711 μ-law (mulaw) to us
+            # - We want OpenAI to SEND BACK the same (so Twilio can play it)
+            await oai_ws.send_json({
+                "type": "session.update",
+                "session": {
+                    "modalities": ["audio"],
+                    "instructions": (
+                        "You are the phone receptionist for Riteway Landscape Materials in Grantsville, Utah. "
+                        "Be brief, friendly, and professional. Collect: caller name, callback number, address, "
+                        "material, quantity (yards/tons), and preferred delivery window. If unsure on pricing, "
+                        "give a range and say you will text a confirmed quote."
+                    ),
+                    "input_audio_format":  {"type": "g711_ulaw", "sample_rate_hz": 8000},
+                    "output_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
+                    "voice": "alloy"
+                }
+            })
+
+            # Optional: have the AI greet immediately so you know output works
+            await oai_ws.send_json({"type": "response.create",
+                                    "response": {"instructions": "Hi! This is Riteway. How can I help you today?"}})
+
+            async def twilio_to_openai():
+                async for message in ws.iter_text():
+                    data = json.loads(message)
+                    event = data.get("event")
+
+                    if event == "media":
+                        # Twilio gives us base64 mulaw @ 8k
+                        audio_b64 = data["media"]["payload"]
+                        await oai_ws.send_json({
+                            "type": "input_audio_buffer.append",
+                            "audio": audio_b64,
+                            "audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
+                        })
+                        # OPTIONAL: Commit frequently so the AI responds quickly
+                        await oai_ws.send_json({"type": "input_audio_buffer.commit"})
+                        await oai_ws.send_json({"type": "response.create", "response": {"instructions": ""}})
+
+                    elif event == "stop":
+                        # End of stream (usually hangup)
+                        try:
+                            await oai_ws.send_json({"type": "input_audio_buffer.commit"})
+                            await oai_ws.send_json({"type": "response.create", "response": {"instructions": ""}})
+                        except Exception:
+                            pass
+                        break
+
+            async def openai_to_twilio():
+                async for msg in oai_ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        payload = json.loads(msg.data)
+                        typ = payload.get("type", "")
+
+                        # OpenAI streams audio chunks as base64 when output format is g711_ulaw
+                        if typ in ("output_audio.delta", "output_audio_buffer.delta"):
+                            chunk_b64 = payload.get("audio")
+                            if chunk_b64:
+                                await ws.send_json({
+                                    "event": "media",
+                                    "media": {"payload": chunk_b64}
+                                })
+
+                        # You can also watch for errors to log
+                        if typ == "error":
+                            print("OpenAI error:", payload)
+
+            try:
+                await asyncio.gather(twilio_to_openai(), openai_to_twilio())
+            except WebSocketDisconnect:
+                print("❌ Twilio websocket disconnected")
+            finally:
+                await oai_ws.close()
+
 
     # Connect to OpenAI Realtime over websocket
     async with aiohttp.ClientSession() as session:
