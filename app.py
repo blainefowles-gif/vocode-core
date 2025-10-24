@@ -1,9 +1,10 @@
 # app.py — Riteway AI Voice Agent (Twilio <-> OpenAI Realtime)
-# Required:
-#   OPENAI_API_KEY (Render env var)
+# Required env var on Render:
+#   OPENAI_API_KEY
 # Optional:
 #   REALTIME_MODEL (default: gpt-4o-realtime-preview)
-# Start command (Render): uvicorn app:app --host 0.0.0.0 --port $PORT
+# Start command on Render:
+#   uvicorn app:app --host 0.0.0.0 --port $PORT
 
 import os
 import json
@@ -32,22 +33,28 @@ app.add_middleware(
 @app.post("/voice", response_class=PlainTextResponse)
 async def voice(_: Request):
     # Bidirectional media stream to /media
-    twiml = """<?xml version="1.0" encoding="UTF-8"?>
+    return """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="wss://riteway-ai-agent.onrender.com/media" />
   </Connect>
 </Response>"""
-    return twiml
 
-# ----------------------- helper: audio conversions (μ-law<->PCM) ------------------
+# ----------------------- helpers: audio conversions (μ-law<->PCM) -----------------
 
-def ulaw8k_b64_to_pcm16_24k_b64(ulaw_b64: str) -> str:
-    """Twilio → OpenAI: μ-law@8k (base64) -> PCM16@24k (base64)."""
-    ulaw_bytes = base64.b64decode(ulaw_b64)     # μ-law 8k mono
-    pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)  # -> PCM16 8k mono (16-bit)
-    pcm16_24k, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 24000, None)  # -> PCM16 24k mono
-    return base64.b64encode(pcm16_24k).decode("ascii")
+def ulaw8k_b64_to_pcm16_24k(ulaw_b64: str) -> bytes:
+    """
+    Twilio -> OpenAI: μ-law@8k (b64) -> PCM16@24k (raw bytes).
+    - μ-law is 8-bit, 8000 samples/sec mono
+    - We convert to 16-bit PCM mono at 24000 Hz (what OpenAI likes)
+    """
+    ulaw_bytes = base64.b64decode(ulaw_b64)         # μ-law 8k mono
+    pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)      # -> PCM16 8k mono (16-bit)
+    pcm16_24k, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 24000, None)  # -> 24k mono
+    return pcm16_24k  # raw bytes (not b64)
+
+def bytes_to_b64(b: bytes) -> str:
+    return base64.b64encode(b).decode("ascii")
 
 # --------------------- 2) Media WebSocket: Twilio <-> OpenAI bridge ----------------
 
@@ -66,7 +73,7 @@ async def media(ws: WebSocket):
         "OpenAI-Beta": "realtime=v1",
     }
 
-    # Will capture Twilio streamSid from "start"
+    # Capture Twilio streamSid from "start"
     twilio_stream_sid = None
 
     async with aiohttp.ClientSession() as session:
@@ -78,14 +85,14 @@ async def media(ws: WebSocket):
             timeout=0,
         ) as oai_ws:
 
-            # Tell OpenAI what we send in and what we want back
+            # Configure formats:
+            #  - We SEND PCM16@24k to OpenAI
+            #  - We want μ-law@8k BACK (so Twilio can play it)
             await oai_ws.send_json({
                 "type": "session.update",
                 "session": {
                     "modalities": ["audio"],
-                    # We SEND PCM16@24k to OpenAI
                     "input_audio_format":  {"type": "pcm16", "sample_rate_hz": 24000},
-                    # We want μ-law@8k BACK (so Twilio can play it)
                     "output_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
                     "voice": "alloy",
                     "instructions": (
@@ -97,20 +104,28 @@ async def media(ws: WebSocket):
                 }
             })
 
-            # Initial greeting so you hear something right away
+            # Greeting so you hear something even before caller speaks
             await oai_ws.send_json({
                 "type": "response.create",
                 "response": {"instructions": "Hi! This is Riteway. How can I help you today?"}
             })
 
-            # -------- state for batching ----------
-            frames_since_last_commit = 0      # how many Twilio frames are appended since last commit
-            MIN_FRAMES_PER_COMMIT = 8         # ~8 x 20ms ≈ 160ms (safely > 100ms)
+            # ---------------- state for *byte-accurate* batching ----------------
+            # OpenAI minimum: >= 100ms of audio per commit.
+            # At PCM16@24k mono: 24000 samples/sec * 2 bytes/sample = 48000 bytes/sec
+            # 100ms = 0.1 sec -> 4800 bytes. We'll use a SAFE threshold = 150ms -> 7200 bytes.
+            BYTES_PER_SEC_PCM16_24K = 24000 * 2  # 48000
+            MIN_COMMIT_BYTES = int(0.150 * BYTES_PER_SEC_PCM16_24K)  # 7200 bytes (~150ms)
+            bytes_since_last_commit = 0
             producer_running = True
 
-            # -------------- Twilio -> OpenAI (append only, event-driven commit) --------------
             async def twilio_to_openai():
-                nonlocal twilio_stream_sid, frames_since_last_commit, producer_running
+                """
+                Append caller audio to OpenAI buffer as PCM16@24k.
+                Commit ONLY when we've accumulated >= MIN_COMMIT_BYTES.
+                """
+                nonlocal twilio_stream_sid, bytes_since_last_commit, producer_running
+
                 async for message in ws.iter_text():
                     data = json.loads(message)
                     event = data.get("event")
@@ -120,36 +135,35 @@ async def media(ws: WebSocket):
                         print("Twilio start: streamSid =", twilio_stream_sid)
 
                     elif event == "media":
-                        # Convert Twilio μ-law@8k -> PCM16@24k and append to OpenAI buffer
                         try:
                             ulaw_b64 = data["media"]["payload"]
-                            pcm24_b64 = ulaw8k_b64_to_pcm16_24k_b64(ulaw_b64)
+                            pcm24_bytes = ulaw8k_b64_to_pcm16_24k(ulaw_b64)
 
+                            # Append (base64) to OpenAI buffer
                             await oai_ws.send_json({
                                 "type": "input_audio_buffer.append",
-                                "audio": pcm24_b64
+                                "audio": bytes_to_b64(pcm24_bytes)
                             })
-                            frames_since_last_commit += 1
-                            if frames_since_last_commit % 4 == 0:
-                                print(f"frames appended since last commit: {frames_since_last_commit}")
 
-                            # Only COMMIT when we have enough audio (>= ~160ms)
-                            if frames_since_last_commit >= MIN_FRAMES_PER_COMMIT:
-                                print(f"COMMIT ({frames_since_last_commit} frames)  # >=160ms")
+                            bytes_since_last_commit += len(pcm24_bytes)
+                            if bytes_since_last_commit >= MIN_COMMIT_BYTES:
+                                ms = int(1000 * bytes_since_last_commit / BYTES_PER_SEC_PCM16_24K)
+                                print(f"COMMIT by bytes: {bytes_since_last_commit} bytes (~{ms} ms)")
                                 await oai_ws.send_json({"type": "input_audio_buffer.commit"})
                                 await oai_ws.send_json({
                                     "type": "response.create",
-                                    "response": {"instructions": ""}  # continue the turn
+                                    "response": {"instructions": ""}
                                 })
-                                frames_since_last_commit = 0
+                                bytes_since_last_commit = 0
 
                         except Exception as e:
                             print("media convert/append error:", e)
 
                     elif event == "stop":
-                        # Flush ONLY if we have >=100ms worth (avoid empty-commit error)
-                        if frames_since_last_commit >= MIN_FRAMES_PER_COMMIT:
-                            print(f"FINAL COMMIT ({frames_since_last_commit} frames)  # >=160ms")
+                        # Final flush ONLY if we truly have >=100ms worth (by bytes)
+                        if bytes_since_last_commit >= MIN_COMMIT_BYTES:
+                            ms = int(1000 * bytes_since_last_commit / BYTES_PER_SEC_PCM16_24K)
+                            print(f"FINAL COMMIT by bytes: {bytes_since_last_commit} bytes (~{ms} ms)")
                             try:
                                 await oai_ws.send_json({"type": "input_audio_buffer.commit"})
                                 await oai_ws.send_json({
@@ -159,12 +173,17 @@ async def media(ws: WebSocket):
                             except Exception as e:
                                 print("final commit error:", e)
                         else:
-                            print(f"Call stopping with {frames_since_last_commit} frames (<{MIN_FRAMES_PER_COMMIT}); skipping final commit.")
+                            ms = int(1000 * bytes_since_last_commit / BYTES_PER_SEC_PCM16_24K)
+                            print(f"Stop with only {bytes_since_last_commit} bytes (~{ms} ms); skipping final commit.")
                         producer_running = False
                         break
 
-            # -------------------- OpenAI -> Twilio (stream μ-law audio back) -------------------
             async def openai_to_twilio():
+                """
+                Relay OpenAI audio back to Twilio.
+                We requested g711_ulaw@8k, so 'delta' is already μ-law@8k base64.
+                Always include streamSid — without it, Twilio can be silent.
+                """
                 nonlocal twilio_stream_sid
                 async for msg in oai_ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
@@ -173,12 +192,11 @@ async def media(ws: WebSocket):
                         print("OAI event:", typ)
 
                         if typ == "response.audio.delta":
-                            # Because we requested output g711_ulaw@8k, 'delta' is μ-law@8k base64.
                             chunk_b64 = payload.get("delta")
                             if chunk_b64 and twilio_stream_sid:
                                 await ws.send_json({
                                     "event": "media",
-                                    "streamSid": twilio_stream_sid,   # include streamSid for Twilio playback
+                                    "streamSid": twilio_stream_sid,
                                     "media": {"payload": chunk_b64}
                                 })
 
