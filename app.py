@@ -1,7 +1,7 @@
 # app.py — Riteway AI Voice Agent (Twilio <-> OpenAI Realtime)
-# Assumes:
+# Requirements:
 #   - Env var OPENAI_API_KEY set in Render
-#   - (optional) REALTIME_MODEL (default gpt-4o-realtime-preview)
+#   - (optional) REALTIME_MODEL (default: gpt-4o-realtime-preview)
 # Start command (Render): uvicorn app:app --host 0.0.0.0 --port $PORT
 
 import os
@@ -29,6 +29,7 @@ app.add_middleware(
 # --- 1) Twilio webhook: open a BIDIRECTIONAL stream to /media ---
 @app.post("/voice", response_class=PlainTextResponse)
 async def voice(_: Request):
+    # This TwiML tells Twilio to connect a bidirectional media stream to our /media WebSocket
     twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -36,6 +37,7 @@ async def voice(_: Request):
   </Connect>
 </Response>"""
     return twiml
+
 
 # --- 2) Media WebSocket: Twilio <-> OpenAI Realtime bridge ---
 @app.websocket("/media")
@@ -53,6 +55,10 @@ async def media(ws: WebSocket):
         "OpenAI-Beta": "realtime=v1",
     }
 
+    # We'll capture Twilio's streamSid from the 'start' event and include it
+    # in every audio message we send back. This prevents "silent" playback.
+    twilio_stream_sid = None
+
     async with aiohttp.ClientSession() as session:
         async with session.ws_connect(
             f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}",
@@ -61,7 +67,7 @@ async def media(ws: WebSocket):
             heartbeat=20,
             timeout=0,
         ) as oai_ws:
-            # IMPORTANT: Tell OpenAI we will send PCM16 at 24 kHz, but we want μ-law 8 kHz back for Twilio.
+            # Tell OpenAI we will SEND PCM16@24k and we want μ-law@8k BACK.
             await oai_ws.send_json({
                 "type": "session.update",
                 "session": {
@@ -72,9 +78,7 @@ async def media(ws: WebSocket):
                         "material, quantity (yards/tons), and preferred delivery window. If unsure on pricing, "
                         "give a range and say you will text a confirmed quote."
                     ),
-                    # INPUT to OpenAI (what we send): PCM16 24kHz
                     "input_audio_format":  {"type": "pcm16", "sample_rate_hz": 24000},
-                    # OUTPUT from OpenAI (what we need Twilio to play): μ-law 8kHz
                     "output_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
                     "voice": "alloy"
                 }
@@ -86,54 +90,57 @@ async def media(ws: WebSocket):
                 "response": {"instructions": "Hi! This is Riteway. How can I help you today?"}
             })
 
+            # Convert Twilio μ-law@8k -> PCM16@24k for OpenAI input
+            def ulaw8k_b64_to_pcm16_24k_b64(ulaw_b64: str) -> str:
+                ulaw_bytes = base64.b64decode(ulaw_b64)      # μ-law 8k mono
+                pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)   # -> PCM16 8k mono
+                pcm16_24k, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 24000, None)  # -> PCM16 24k mono
+                return base64.b64encode(pcm16_24k).decode("ascii")
+
             # ---------- Twilio -> OpenAI ----------
-            # We'll buffer frames and commit on a timer (≈120ms) so we never commit an empty buffer.
+            # We'll buffer inbound frames and only commit when we have enough (~>=7 frames) or every 200ms.
             frames_buffered = 0
             producer_running = True
 
-            def ulaw8k_b64_to_pcm16_24k_b64(ulaw_b64: str) -> str:
-                """Convert Twilio μ-law@8k (base64) -> PCM16@24k (base64) for OpenAI input."""
-                ulaw_bytes = base64.b64decode(ulaw_b64)          # μ-law 8k, 8-bit mono
-                pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)       # -> PCM16 8k, 16-bit mono
-                pcm16_24k, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 24000, None)  # upsample to 24k
-                return base64.b64encode(pcm16_24k).decode("ascii")
-
             async def twilio_to_openai():
-                nonlocal frames_buffered, producer_running
+                nonlocal twilio_stream_sid, frames_buffered, producer_running
                 async for message in ws.iter_text():
                     data = json.loads(message)
                     event = data.get("event")
 
                     if event == "start":
-                        # stream started
-                        continue
+                        # Capture Twilio streamSid (required when sending audio back to Twilio)
+                        twilio_stream_sid = data.get("start", {}).get("streamSid")
+                        print("Twilio start: streamSid =", twilio_stream_sid)
 
-                    if event == "media":
-                        # Twilio sends μ-law@8k base64
-                        ulaw_b64 = data["media"]["payload"]
-                        # Convert to PCM16@24k for OpenAI
-                        pcm24_b64 = ulaw8k_b64_to_pcm16_24k_b64(ulaw_b64)
+                    elif event == "media":
+                        # Twilio sends μ-law@8k base64. Convert to PCM16@24k for OpenAI input.
+                        try:
+                            ulaw_b64 = data["media"]["payload"]
+                            pcm24_b64 = ulaw8k_b64_to_pcm16_24k_b64(ulaw_b64)
 
-                        # Append ONLY (no audio_format here)
-                        await oai_ws.send_json({
-                            "type": "input_audio_buffer.append",
-                            "audio": pcm24_b64
-                        })
-                        frames_buffered += 1
-                        if frames_buffered % 3 == 0:
-                            print(f"frames buffered: {frames_buffered}")
+                            await oai_ws.send_json({
+                                "type": "input_audio_buffer.append",
+                                "audio": pcm24_b64
+                            })
+                            frames_buffered += 1
+                            if frames_buffered % 3 == 0:
+                                print(f"frames buffered: {frames_buffered}")
+                        except Exception as e:
+                            print("media convert/append error:", e)
 
                     elif event == "stop":
                         producer_running = False
                         break
 
+            # ---------- Commit timer: every 200ms, commit ONLY if we have ≥7 frames (~140ms) ----------
             async def commit_timer():
                 nonlocal frames_buffered, producer_running
                 try:
                     while producer_running:
-                        await asyncio.sleep(0.12)  # ~120 ms
-                        if frames_buffered > 0:
-                            print(f"COMMIT ({frames_buffered} frames)")
+                        await asyncio.sleep(0.20)  # ~200 ms (safely above 100 ms)
+                        if frames_buffered >= 7:
+                            print(f"COMMIT ({frames_buffered} frames)  # committing >100ms")
                             await oai_ws.send_json({"type": "input_audio_buffer.commit"})
                             await oai_ws.send_json({
                                 "type": "response.create",
@@ -143,8 +150,8 @@ async def media(ws: WebSocket):
                 except Exception as e:
                     print("commit_timer error:", e)
 
-                # final flush
-                if frames_buffered > 0:
+                # Final flush when call ends
+                if frames_buffered >= 7:
                     print(f"FINAL COMMIT ({frames_buffered} frames)")
                     try:
                         await oai_ws.send_json({"type": "input_audio_buffer.commit"})
@@ -154,10 +161,11 @@ async def media(ws: WebSocket):
                         })
                     except Exception as e:
                         print("final flush error:", e)
-                    frames_buffered = 0
+                frames_buffered = 0
 
             # ---------- OpenAI -> Twilio ----------
             async def openai_to_twilio():
+                nonlocal twilio_stream_sid
                 async for msg in oai_ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         payload = json.loads(msg.data)
@@ -165,15 +173,18 @@ async def media(ws: WebSocket):
                         print("OAI event:", typ)
 
                         if typ == "response.audio.delta":
-                            # Because we requested output g711_ulaw@8k, 'delta' should already be μ-law 8k base64.
+                            # Because we requested output g711_ulaw@8k, 'delta' is μ-law 8k base64.
                             chunk_b64 = payload.get("delta")
-                            if chunk_b64:
+                            if chunk_b64 and twilio_stream_sid:
+                                # IMPORTANT: include streamSid when sending audio to Twilio
                                 await ws.send_json({
                                     "event": "media",
+                                    "streamSid": twilio_stream_sid,
                                     "media": {"payload": chunk_b64}
                                 })
 
                         elif typ in ("response.done", "response.completed", "response.audio.done"):
+                            # End of an assistant turn
                             pass
 
                         elif typ == "error":
@@ -192,6 +203,7 @@ async def media(ws: WebSocket):
                 print("❌ Twilio websocket disconnected")
             finally:
                 await oai_ws.close()
+
 
 # Health check
 @app.get("/health")
