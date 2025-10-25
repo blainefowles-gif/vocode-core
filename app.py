@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
 
 ###############################################################################
-# BASIC CONFIG
+# CONFIG
 ###############################################################################
 
 PUBLIC_BASE_URL = "https://riteway-ai-agent.onrender.com"
@@ -33,7 +33,7 @@ app.add_middleware(
 )
 
 ###############################################################################
-# HEALTHCHECK
+# HEALTH
 ###############################################################################
 
 @app.get("/health")
@@ -45,16 +45,16 @@ async def health():
     })
 
 ###############################################################################
-# /voice  (Twilio hits this first)
+# /voice - Twilio webhook to start call
 ###############################################################################
 
 @app.post("/voice", response_class=PlainTextResponse)
 async def voice(_: Request):
     """
-    Twilio calls this URL first.
-    We respond with TwiML telling Twilio:
-    - wait ~1.2 seconds (so we don't clip the greeting),
-    - then open a bidirectional audio Stream to /media.
+    Twilio hits this first.
+    We:
+    - Pause ~1.2s so we don't clip the greeting.
+    - Open <Stream> back to our /media websocket.
     """
     logging.info("☎ Twilio hit /voice")
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -67,7 +67,7 @@ async def voice(_: Request):
     return PlainTextResponse(content=twiml, media_type="application/xml")
 
 ###############################################################################
-# /media  (live audio websocket Twilio <-> our server <-> OpenAI Realtime)
+# /media  (Twilio <-> us <-> OpenAI Realtime)
 ###############################################################################
 
 @app.websocket("/media")
@@ -75,24 +75,31 @@ async def media(ws: WebSocket):
     await ws.accept()
     logging.info("✅ Twilio connected to /media")
 
+    if not OPENAI_API_KEY:
+        logging.error("❌ No OPENAI_API_KEY set in environment")
+        await ws.close()
+        return
+
+    # Twilio stream ID
     stream_sid = None
 
-    # queue of μ-law audio chunks (base64 strings) to send back to Twilio
+    # Queue of audio chunks (already ulaw 8kHz base64) we will send back to Twilio
     playback_queue = deque()
-    playback_running = True
 
-    # control flags
-    caller_audio_seen = False   # did we receive caller speech recently?
-    ai_busy = False             # is OpenAI currently talking?
+    # Control flags/state
+    playback_running = True
+    ai_busy = False  # True while AI is in the middle of generating a response
+    greeted = False  # True after we play the initial greeting
+    caller_audio_since_last_commit_bytes = 0  # how many bytes we buffered since last "turn"
+    caller_has_spoken_once = False  # becomes True after first human audio
 
     ###########################################################################
-    # playback_loop
+    # playback_loop: drip audio back to caller
     ###########################################################################
     async def playback_loop():
         """
-        Send AI audio chunks back to the caller at ~20ms pace.
-        Twilio wants μ-law (G.711 u-law) 8kHz mono.
-        We assume items in playback_queue are ALREADY base64 u-law @8kHz.
+        Twilio expects 8kHz mono μ-law (G.711 u-law), base64 payload,
+        dripping ~20ms chunks.
         """
         await asyncio.sleep(0.1)
         while playback_running:
@@ -103,54 +110,78 @@ async def media(ws: WebSocket):
                     "streamSid": stream_sid,
                     "media": {"payload": ulaw_chunk_b64}
                 })
-                await asyncio.sleep(0.02)  # ~20ms pacing
+                await asyncio.sleep(0.02)  # about 20ms pacing
             else:
                 await asyncio.sleep(0.005)
 
     ###########################################################################
-    # speech_drive_loop
+    # helper: push PCM16 24k -> μ-law 8kHz into playback_queue
     ###########################################################################
-    async def speech_drive_loop(oai_ws):
+    def enqueue_pcm16_from_openai(pcm16_24k: bytes):
         """
-        Every 0.5 seconds:
-        - If caller_audio_seen == True and ai_busy == False:
-              commit audio buffer + request response
-        - Then set ai_busy = True, caller_audio_seen = False
-        - When we later get response.done from OpenAI, we'll set ai_busy = False
-        This stops us from spamming response.create.
+        OpenAI gives us PCM16 mono 24kHz in response.audio.delta chunks.
+        We:
+          1. downsample 24k -> 8kHz PCM16 mono
+          2. convert PCM16 -> μ-law
+          3. base64 encode
+          4. append to playback_queue
         """
-        nonlocal caller_audio_seen, ai_busy, playback_running
-        while playback_running:
-            await asyncio.sleep(0.5)
-
-            if caller_audio_seen and not ai_busy:
-                ai_busy = True
-                caller_audio_seen = False
-                try:
-                    # Tell OpenAI: "that's the end of the caller's turn"
-                    await oai_ws.send_json({
-                        "type": "input_audio_buffer.commit"
-                    })
-                    # Ask it to talk back
-                    await oai_ws.send_json({
-                        "type": "response.create",
-                        "response": {
-                            # letting it respond normally now
-                        }
-                    })
-                except Exception:
-                    logging.exception("⚠ commit/response.create in speech_drive_loop failed")
+        # 24k -> 8k PCM16
+        pcm16_8k, _ = audioop.ratecv(
+            pcm16_24k,
+            2,      # 16-bit
+            1,      # mono
+            24000,
+            8000,
+            None
+        )
+        # PCM16 -> μ-law @8kHz
+        ulaw_bytes = audioop.lin2ulaw(pcm16_8k, 2)
+        ulaw_b64 = base64.b64encode(ulaw_bytes).decode("ascii")
+        playback_queue.append(ulaw_b64)
 
     ###########################################################################
-    # forward_twilio_to_openai
+    # say_greeting_once: queue our custom greeting audio
+    ###########################################################################
+    async def say_greeting_once(oai_ws):
+        """
+        We send response.create with a fixed intro line,
+        but only ONCE, and only after Twilio stream is ready.
+        """
+        nonlocal greeted, ai_busy
+        if greeted:
+            return
+        greeted = True
+        ai_busy = True  # AI is about to talk
+        logging.info("👋 Sending greeting request to OpenAI")
+        await oai_ws.send_json({
+            "type": "response.create",
+            "response": {
+                "instructions": (
+                    # Must match EXACT wording we want callers to hear:
+                    "Hello, thanks for calling Riteway Landscape Products! How can I help you?"
+                )
+            }
+        })
+
+    ###########################################################################
+    # forward_twilio_to_openai: user's audio -> OpenAI
     ###########################################################################
     async def forward_twilio_to_openai(oai_ws):
         """
-        Read audio from Twilio:
-        - Twilio sends G.711 μ-law 8kHz mono chunks (base64).
-        Convert to PCM16 24kHz mono before feeding to OpenAI input buffer.
+        We receive Twilio messages:
+          - 'start': contains streamSid
+          - 'media': 20ms chunks of μ-law 8kHz mono audio from caller
+          - 'stop': call ended
+
+        We:
+          - convert μ-law 8k -> PCM16 24k
+          - append to OpenAI input_audio_buffer
+          - track how many bytes we've sent since last commit
         """
-        nonlocal stream_sid, caller_audio_seen, playback_running
+        nonlocal stream_sid
+        nonlocal caller_audio_since_last_commit_bytes
+        nonlocal caller_has_spoken_once
 
         while True:
             try:
@@ -175,25 +206,28 @@ async def media(ws: WebSocket):
                 call_sid = data["start"].get("callSid")
                 logging.info(f"📞 Twilio start: streamSid={stream_sid} callSid={call_sid}")
 
+                # as soon as Twilio is ready, queue the greeting for the caller
+                await say_greeting_once(oai_ws)
+
             elif event == "media":
-                # Twilio gives μ-law 8kHz mono (base64)
+                # Twilio gives μ-law 8kHz mono in base64
                 ulaw_b64 = data["media"]["payload"]
                 ulaw_bytes = base64.b64decode(ulaw_b64)
 
-                # μ-law -> 16-bit PCM @8kHz
+                # μ-law -> PCM16 mono @8kHz
                 pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)
 
-                # upsample 8kHz -> 24kHz
+                # upsample 8k -> 24k PCM16 mono for OpenAI
                 pcm16_24k, _ = audioop.ratecv(
-                    pcm16_8k,  # audio bytes
-                    2,         # width (2 bytes = 16-bit)
-                    1,         # mono
-                    8000,      # from sample rate
-                    24000,     # to sample rate
+                    pcm16_8k,
+                    2,      # width=2 bytes (16-bit)
+                    1,      # mono
+                    8000,
+                    24000,
                     None
                 )
 
-                # send to OpenAI input buffer
+                # Send chunk to OpenAI
                 if oai_ws is not None:
                     try:
                         b64_audio = base64.b64encode(pcm16_24k).decode("ascii")
@@ -201,7 +235,9 @@ async def media(ws: WebSocket):
                             "type": "input_audio_buffer.append",
                             "audio": b64_audio,
                         })
-                        caller_audio_seen = True
+                        # Track that caller talked
+                        caller_has_spoken_once = True
+                        caller_audio_since_last_commit_bytes += len(pcm16_24k)
                     except Exception:
                         logging.exception("⚠ error sending audio chunk to OpenAI")
 
@@ -210,56 +246,34 @@ async def media(ws: WebSocket):
                 break
 
         logging.info("🚪 forward_twilio_to_openai exiting")
-        playback_running = False
 
     ###########################################################################
-    # forward_openai_to_twilio
+    # forward_openai_to_twilio: AI audio -> caller
     ###########################################################################
     async def forward_openai_to_twilio(oai_ws):
         """
-        Listen for OpenAI events.
-        For response.audio.delta:
-          - OpenAI will send us base64 PCM16 audio (24kHz mono).
-          - We convert 24kHz PCM16 -> 8kHz PCM16 -> μ-law -> base64.
-          - Push that into playback_queue so playback_loop can send to Twilio.
-        When OpenAI says response.done / response.interrupted:
-          - Set ai_busy = False so we can generate the next answer later.
+        Listen to OpenAI Realtime events.
+        - response.audio.delta -> queue PCM16 audio (after convert to μ-law)
+        - response.done / response.interrupted -> mark ai_busy False
+        - error -> log
         """
-        nonlocal ai_busy, playback_running
+        nonlocal ai_busy
+        nonlocal playback_running
 
         try:
             async for raw in oai_ws:
                 if raw.type != aiohttp.WSMsgType.TEXT:
                     continue
-
                 data = json.loads(raw.data)
                 oai_type = data.get("type")
                 logging.info(f"🤖 OAI event: {oai_type}")
 
                 if oai_type == "response.audio.delta":
+                    # base64 PCM16 mono @24kHz from OpenAI
                     pcm16_24k_b64 = data.get("delta")
                     if pcm16_24k_b64:
-                        # decode PCM16 24kHz mono from OpenAI
                         pcm16_24k = base64.b64decode(pcm16_24k_b64)
-
-                        # downsample 24kHz -> 8kHz PCM16 mono
-                        pcm16_8k, _ = audioop.ratecv(
-                            pcm16_24k,
-                            2,      # width=2 bytes (16-bit)
-                            1,      # mono
-                            24000,  # from 24kHz
-                            8000,   # to 8kHz
-                            None
-                        )
-
-                        # PCM16 -> μ-law bytes (8kHz mono)
-                        ulaw_bytes = audioop.lin2ulaw(pcm16_8k, 2)
-
-                        # base64 so Twilio will play it
-                        ulaw_b64 = base64.b64encode(ulaw_bytes).decode("ascii")
-
-                        # queue for playback_loop
-                        playback_queue.append(ulaw_b64)
+                        enqueue_pcm16_from_openai(pcm16_24k)
 
                 elif oai_type == "response.done":
                     ai_busy = False
@@ -267,7 +281,7 @@ async def media(ws: WebSocket):
 
                 elif oai_type == "response.interrupted":
                     ai_busy = False
-                    logging.info("⛔ AI interrupted due to caller talking")
+                    logging.info("⛔ AI interrupted (barge-in)")
 
                 elif oai_type == "error":
                     logging.error(f"❌ OpenAI error event: {data}")
@@ -279,16 +293,61 @@ async def media(ws: WebSocket):
         playback_running = False
 
     ###########################################################################
-    # connect to OpenAI Realtime, set session, greet
+    # speech_drive_loop: decide when to ask OpenAI to answer
     ###########################################################################
-    if not OPENAI_API_KEY:
-        logging.error("❌ No OPENAI_API_KEY set in environment")
-        await ws.close()
-        return
+    async def speech_drive_loop(oai_ws):
+        """
+        Every 0.5s:
+        - If caller has spoken, we have >100ms audio (about ~4800 bytes at 24kHz 16-bit),
+          and AI is not currently busy, we:
+            1. commit the audio buffer (end caller turn)
+            2. ask OpenAI to respond
+          then reset counter.
 
-    async with aiohttp.ClientSession() as session:
+        This prevents:
+        - committing when buffer is empty  -> fixes 'buffer too small' error
+        - blasting multiple responses while it's already talking
+        """
+        nonlocal caller_audio_since_last_commit_bytes
+        nonlocal ai_busy
+
+        MIN_BYTES_FOR_COMMIT = 4800  # ~100ms of 24kHz 16-bit mono audio
+
+        while playback_running:
+            await asyncio.sleep(0.5)
+
+            # conditions to trigger AI reply
+            if (
+                caller_audio_since_last_commit_bytes >= MIN_BYTES_FOR_COMMIT
+                and not ai_busy
+            ):
+                logging.info(
+                    f"🗣 committing {caller_audio_since_last_commit_bytes} bytes of caller audio to OpenAI"
+                )
+                ai_busy = True  # we're about to make it talk
+                try:
+                    await oai_ws.send_json({
+                        "type": "input_audio_buffer.commit"
+                    })
+                    await oai_ws.send_json({
+                        "type": "response.create",
+                        "response": {
+                            # no custom instructions here -> it will use session instructions
+                        }
+                    })
+                except Exception:
+                    logging.exception("⚠ commit/response.create failed")
+
+                # reset
+                caller_audio_since_last_commit_bytes = 0
+
+    ###########################################################################
+    # CONNECT to OpenAI Realtime
+    ###########################################################################
+
+    async with aiohttp.ClientSession() as session_http:
         try:
-            async with session.ws_connect(
+            async with session_http.ws_connect(
                 f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}",
                 headers={
                     "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -296,70 +355,66 @@ async def media(ws: WebSocket):
                 },
             ) as oai_ws:
                 logging.info("✅ Connected to OpenAI Realtime successfully!")
-                logging.info(f"🔑 OPENAI_API_KEY is present")
+                logging.info("🔑 OPENAI_API_KEY is present")
 
-                # Tell OpenAI how to behave
+                # Tell OpenAI how to behave for the WHOLE CALL.
+                # Strong rules: greeting, tone, pricing, delivery logic, math, barge-in rules.
                 await oai_ws.send_json({
                     "type": "session.update",
                     "session": {
-                        # We want speech and text
+                        # we want both speech and text
                         "modalities": ["audio", "text"],
 
-                        # Caller audio we send in is 24k PCM16 mono
+                        # AUDIO IN we send: PCM16 mono 24k
                         "input_audio_format": "pcm16",
 
-                        # We will handle conversion ourselves, so we want PCM16 out
+                        # AUDIO OUT we want: PCM16 mono 24k
+                        # (we will downsample + mu-law ourselves)
                         "output_audio_format": "pcm16",
 
-                        # Voice to synthesize
                         "voice": "alloy",
 
-                        # Barge-in / turn-taking
+                        # Let model stop talking if caller interrupts
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.4,
                             "silence_duration_ms": 200,
-                            "create_response": True,
+                            "create_response": False,
                             "allow_agent_interrupt": True
                         },
 
-                        # Business rules, tone, prices, math, etc.
                         "instructions": (
-                            # === GREETING RULE ===
-                            "GREETING RULE:\n"
-                            "The VERY FIRST THING you say on the call MUST be exactly:\n"
+                            # *** CRITICAL TOP RULES ***
+                            "TOP PRIORITY RULES:\n"
+                            "1. Do not start talking until either (a) you are explicitly asked to greet "
+                            "or (b) you are asked to answer after the caller talks.\n"
+                            "2. When you are told to greet, your FIRST spoken line must be EXACTLY:\n"
                             "\"Hello, thanks for calling Riteway Landscape Products! How can I help you?\"\n"
-                            "Do not rephrase that opening line. Do not add anything before it.\n"
-                            "After that first line, act normally.\n\n"
+                            "Do not change that wording. Do not add anything before it.\n"
+                            "Say it one time at the start of the call.\n"
+                            "After that, speak naturally.\n"
+                            "3. Keep answers under about 20 seconds unless giving prices or doing coverage math.\n"
+                            "4. If the caller interrupts you, stop talking immediately.\n\n"
 
-                            # === VOICE / TONE ===
-                            "TONE & STYLE:\n"
-                            "- You are a real dispatcher at a bulk landscape supply yard.\n"
-                            "- Warm, confident, efficient. Local vibe, not corporate.\n"
-                            "- Keep answers under ~20 seconds unless giving prices or doing coverage math.\n"
-                            "- If caller starts talking while you are talking, STOP immediately.\n"
-                            "- Do not over-apologize. Just keep helping.\n\n"
-
-                            # === BUSINESS INFO ===
-                            "BUSINESS INFO:\n"
-                            "- Business: Riteway Landscape Products.\n"
+                            "ABOUT RITEWAY:\n"
+                            "- Business name: Riteway Landscape Products.\n"
                             "- We sell bulk landscape material by the cubic yard.\n"
-                            "- Hours: Monday–Friday, 9 AM to 5 PM. No after-hours, no weekends.\n"
-                            "- We mainly serve Tooele Valley and surrounding areas.\n"
-                            "- Most callers already know what they want.\n\n"
+                            "- Hours: Monday–Friday, 9 AM to 5 PM. No weekends, no after-hours.\n"
+                            "- We mainly serve the Tooele Valley and surrounding areas.\n"
+                            "- Most callers already know what they want, like pea gravel or road base.\n\n"
 
-                            # === MATERIAL KNOWLEDGE ===
                             "MATERIAL EXPERTISE:\n"
-                            "- Washed pea gravel: small rounded gravel, great for play areas, dog runs, walking areas.\n"
-                            "- Desert Sun decorative rock: tan/brown rock for xeriscape / front yard curb appeal.\n"
-                            "- Road base / crushed rock: compacts hard, good for driveways and parking pads.\n"
+                            "- Washed pea gravel: small rounded gravel, great for play areas, dog runs, walk paths.\n"
+                            "- Desert Sun decorative rock: tan/brown, looks good for xeriscape/front yard.\n"
+                            "- Road base / crushed rock: compacts hard, great for driveways and parking pads.\n"
                             "- Top soil / screened premium top soil: lawns, gardens, leveling low spots.\n"
-                            "- Bark / mulch: helps with weed suppression and moisture around plants.\n"
-                            "- Cobble / boulders: borders, dry creek beds, accent rock.\n"
-                            "If caller asks 'what should I use for ___?', answer like an experienced yard guy.\n\n"
+                            "- Bark / mulch: weed suppression and moisture control around plants.\n"
+                            "- Cobble / boulders: borders, dry creek beds, accents.\n"
+                            "If they ask \"what should I use for ___?\", answer like an experienced landscape yard person.\n"
+                            "Do NOT talk about succulents, flowers, design services, irrigation kits, etc. "
+                            "We are a bulk rock / soil / bark yard, not a nursery.\n\n"
 
-                            # === PRICING (ALWAYS SAY 'PER YARD' or 'PER TON') ===
-                            "PRICING:\n"
+                            "PRICING (ALWAYS SAY 'PER YARD' or 'PER TON'):\n"
                             "- Washed Pea Gravel: $42 per yard.\n"
                             "- Desert Sun 7/8\" Crushed Rock: $40 per yard.\n"
                             "- 7/8\" Crushed Rock: $25 per yard.\n"
@@ -376,91 +431,73 @@ async def media(ws: WebSocket):
                             "- Washed Sand: $65 per yard.\n"
                             "- Premium Mulch: $44 per yard.\n"
                             "- Colored Shredded Bark: $76 per yard.\n"
-                            "When you say a price, include 'per yard' or 'per ton'. Example:\n"
+                            "When giving a price, ALWAYS say 'per yard' or 'per ton'. Example:\n"
                             "\"Washed pea gravel is forty-two dollars per yard.\"\n\n"
 
-                            # === DELIVERY RULES ===
                             "DELIVERY:\n"
                             "- We can haul up to 16 yards per load.\n"
                             "- $75 delivery fee to Grantsville.\n"
                             "- $115 delivery fee to Tooele / Stansbury / rest of Tooele Valley.\n"
-                            "- Outside Tooele Valley (for example Magna):\n"
+                            "- Outside Tooele Valley, like Magna:\n"
                             "   1. Ask for full delivery address.\n"
-                            "   2. Repeat it back and confirm it's correct.\n"
-                            "   3. Say: 'We charge seven dollars per mile from our yard in Grantsville, Utah.'\n"
-                            "   4. Say: 'We'll confirm that total when dispatch calls you back.'\n"
-                            "- Never promise an exact delivery time. Say:\n"
+                            "   2. Repeat it back and confirm.\n"
+                            "   3. Say: \"We charge seven dollars per mile from our yard in Grantsville, Utah. "
+                            "Dispatch will confirm the final total with you.\" \n"
+                            "- Never promise an exact time window. Say:\n"
                             "\"We'll confirm the delivery window with dispatch.\"\n\n"
 
-                            # === ORDER CAPTURE ===
-                            "IF THEY WANT TO PLACE AN ORDER / DELIVERY:\n"
+                            "IF THEY WANT TO PLACE AN ORDER:\n"
                             "Collect:\n"
-                            "1. Material they want.\n"
-                            "2. How many yards (remind them: up to 16 yards per load).\n"
+                            "1. Material name.\n"
+                            "2. How many yards (remind them we haul up to 16 yards per load).\n"
                             "3. Delivery address.\n"
                             "4. When they want it dropped.\n"
-                            "5. Their name and callback number.\n"
+                            "5. Their name and call-back number.\n"
                             "Then say:\n"
                             "\"Perfect, we'll confirm timing and call you back to lock this in.\"\n\n"
 
-                            # === COVERAGE / YARDAGE MATH ===
-                            "COVERAGE ESTIMATES:\n"
-                            "- One cubic yard covers roughly 100 square feet at about 3 inches deep.\n"
-                            "- Formula to figure yards from dimensions:\n"
+                            "COVERAGE / YARDAGE MATH:\n"
+                            "- One cubic yard covers ~100 square feet at ~3 inches deep.\n"
+                            "- Formula for how many yards they need:\n"
                             "  yards = (length_ft * width_ft * (depth_in / 12)) / 27\n"
-                            "- Round to one decimal place when you answer.\n"
-                            "- Example style:\n"
+                            "- Round to one decimal place.\n"
+                            "Example answer style:\n"
                             "\"That area is about 4.5 yards. We can haul up to 16 yards per load.\"\n"
-                            "If they ask 'how much will a yard cover?', answer:\n"
+                            "If they ask \"how much does a yard cover?\":\n"
                             "\"One yard covers roughly 100 square feet at about three inches deep.\"\n\n"
 
-                            # === HOURS / AFTER HOURS ===
-                            "HOURS POLICY:\n"
-                            "- Hours are Monday–Friday, 9 AM to 5 PM.\n"
-                            "- No weekends, no after-hours.\n"
-                            "- If they ask for weekend delivery:\n"
-                            "\"We're not running weekends, but I can take your info and dispatch will call you during business hours.\"\n\n"
+                            "HOURS / AFTER HOURS:\n"
+                            "- If they want weekend or after 5 PM:\n"
+                            "\"We're Monday through Friday, nine to five. I can take your info "
+                            "and dispatch will call you back during business hours.\"\n\n"
 
-                            # === HOW TO TALK ===
-                            "CALL FLOW:\n"
-                            "1. FIRST LINE: Say the exact greeting line.\n"
-                            "2. Ask how you can help.\n"
-                            "3. Answer directly.\n"
-                            "4. If they sound ready to buy, collect delivery/order details.\n"
-                            "5. If they interrupt you, STOP immediately and listen.\n"
-                            "6. Keep it tight and helpful, like a dispatcher.\n"
+                            "CONVERSATION STYLE:\n"
+                            "- Sound like a real dispatcher in Tooele Valley.\n"
+                            "- Be warm, professional, and firm.\n"
+                            "- Stop talking immediately if the caller interrupts.\n"
+                            "- Do not free-style about topics we don't sell.\n"
                         )
                     }
                 })
 
-                # Force the very first spoken line so we don't rely on VAD timing:
-                await oai_ws.send_json({
-                    "type": "response.create",
-                    "response": {
-                        "instructions": (
-                            "Hello, thanks for calling Riteway Landscape Products! How can I help you?"
-                        )
-                    }
-                })
-
-                # Start helper tasks
+                # Now spin up helper coroutines
                 playback_task = asyncio.create_task(playback_loop())
                 driver_task = asyncio.create_task(speech_drive_loop(oai_ws))
 
-                # Run pump loops until call ends
+                # Bridge Twilio<->OpenAI until hangup
                 await asyncio.gather(
                     forward_twilio_to_openai(oai_ws),
                     forward_openai_to_twilio(oai_ws),
                 )
 
-                # cleanup after hangup
+                # cleanup
                 driver_task.cancel()
                 playback_task.cancel()
 
         except Exception:
             logging.exception("❌ Failed talking to OpenAI realtime. Check API key/billing/model access.")
 
-    # finally close Twilio socket if still open
+    # close Twilio socket if still open
     try:
         await ws.close()
     except Exception:
@@ -468,8 +505,9 @@ async def media(ws: WebSocket):
 
     logging.info("🔚 /media connection closed")
 
+
 ###############################################################################
-# LOCAL DEV ENTRYPOINT
+# LOCAL DEV
 ###############################################################################
 
 if __name__ == "__main__":
