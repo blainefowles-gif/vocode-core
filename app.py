@@ -95,17 +95,23 @@ async def voice(_: Request):
 
 @app.websocket("/media")
 async def media(ws: WebSocket):
-    # IMPORTANT:
-    # Twilio often requests Sec-WebSocket-Protocol: audio
-    # If we don't accept a subprotocol, Twilio may refuse the connection.
-    try:
-        await ws.accept(subprotocol="audio")
-    except TypeError:
-        # If your FastAPI/Starlette version doesn't support subprotocol arg,
-        # accept normally (but Twilio may fail in that case).
+    # ✅ IMPORTANT FIX:
+    # Only accept a WebSocket subprotocol if Twilio requested one.
+    # If we send a subprotocol when none was requested, Twilio errors with:
+    # "Server sent a subprotocol but none was requested" (31924)
+    requested = ws.headers.get("sec-websocket-protocol")
+    if requested:
+        offered = [p.strip() for p in requested.split(",") if p.strip()]
+        try:
+            await ws.accept(subprotocol=offered[0])
+            logging.info(f"✅ Twilio connected to /media (accepted subprotocol={offered[0]})")
+        except TypeError:
+            # Older starlette might not support subprotocol arg
+            await ws.accept()
+            logging.info("✅ Twilio connected to /media (no subprotocol support in server)")
+    else:
         await ws.accept()
-
-    logging.info("✅ Twilio connected to /media (WebSocket accepted)")
+        logging.info("✅ Twilio connected to /media (no subprotocol requested)")
 
     if not OPENAI_API_KEY:
         logging.error("❌ No OPENAI_API_KEY set")
@@ -400,6 +406,7 @@ async def media(ws: WebSocket):
         pass
 
     logging.info("🔚 /media connection closed")
+
 
 if __name__ == "__main__":
     import uvicorn
