@@ -3,6 +3,7 @@ import json
 import asyncio
 import base64
 import logging
+import time
 from collections import deque
 
 import aiohttp
@@ -18,12 +19,9 @@ PUBLIC_BASE_URL = "https://riteway-ai-agent.onrender.com"
 WS_MEDIA_URL = "wss://" + PUBLIC_BASE_URL.replace("https://", "").replace("http://", "") + "/media"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# Use your model; keep as-is if this is what you already have access to
 REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
 
-# Twilio Media Streams audio is g711 u-law @ 8kHz, base64 payloads
-# We'll set OpenAI Realtime to ALSO use g711_ulaw so we can pass-through.
+# Twilio Media Streams is g711 u-law @ 8kHz. We'll pass-through and set OpenAI the same.
 OAI_AUDIO_FORMAT = "g711_ulaw"
 
 logging.basicConfig(level=logging.INFO)
@@ -38,12 +36,12 @@ app.add_middleware(
 )
 
 ###############################################################################
-# BASIC PAGES (optional but helps avoid confusion)
+# BASIC ROUTES
 ###############################################################################
 
 @app.get("/")
 async def root():
-    return JSONResponse({"ok": True, "message": "Riteway AI Agent is running. Use /voice for Twilio."})
+    return JSONResponse({"ok": True, "message": "Riteway AI Agent is running. Twilio should POST /voice."})
 
 @app.get("/health")
 async def health():
@@ -59,14 +57,7 @@ async def health():
 
 @app.post("/voice", response_class=PlainTextResponse)
 async def voice(_: Request):
-    """
-    Twilio hits this first.
-    We add a short pause so the greeting doesn't get clipped,
-    then we <Stream> back to our /media websocket.
-    """
     logging.info("☎ Twilio hit /voice")
-
-    # Use whole seconds (Twilio is happier this way)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Pause length="1"/>
@@ -91,40 +82,38 @@ async def media(ws: WebSocket):
         return
 
     stream_sid = None
-
-    # Queue of audio chunks (base64 g711_ulaw) to send back to Twilio
     playback_queue = deque()
 
-    # State flags
+    # State
     playback_running = True
     ai_busy = False
     greeted = False
 
-    # Track caller audio so we only commit once we have enough (>= 100ms)
-    frames_since_commit = 0
-    MIN_FRAMES_FOR_COMMIT = 5  # Twilio sends ~20ms per frame => 5 frames = 100ms
+    # Caller audio buffering for commit
+    caller_ulaw_bytes_since_commit = 0
+    last_media_ts = 0.0
+    caller_has_sent_any_audio = False
 
-    # We also want to cancel AI speech when caller talks (barge-in)
-    # This prevents rambling and prevents "active response" errors.
+    # g711_ulaw @8kHz is 8000 bytes/sec
+    # 100ms = 800 bytes. We'll require ~120ms (960 bytes) to be safe.
+    MIN_BYTES_FOR_COMMIT = 960
+
+    # Require a short “pause gap” before committing so we don’t commit mid-word.
+    # This also stops commit spam at call start.
+    SILENCE_GAP_SECONDS = 0.35
+
     async def cancel_ai_response(oai_ws):
+        """Stop AI speech immediately (barge-in) + clear queued audio."""
         nonlocal ai_busy
+        playback_queue.clear()
         try:
             await oai_ws.send_json({"type": "response.cancel"})
         except Exception:
-            # If cancel isn't supported or fails, ignore; we'll still gate on ai_busy.
             pass
-        # Clear queued audio immediately so caller isn't hearing stale speech
-        playback_queue.clear()
         ai_busy = False
 
-    ###########################################################################
-    # playback_loop: drip audio back to caller
-    ###########################################################################
     async def playback_loop():
-        """
-        Twilio expects base64 g711_ulaw payloads, ~20ms pacing.
-        We'll pace the queue out.
-        """
+        """Drip base64 g711_ulaw back to Twilio at ~20ms pacing."""
         await asyncio.sleep(0.05)
         while playback_running:
             if playback_queue and stream_sid:
@@ -134,25 +123,17 @@ async def media(ws: WebSocket):
                     "streamSid": stream_sid,
                     "media": {"payload": chunk_b64},
                 })
-                await asyncio.sleep(0.02)  # ~20ms
+                await asyncio.sleep(0.02)
             else:
                 await asyncio.sleep(0.005)
 
-    ###########################################################################
-    # Greeting: force exact wording at start
-    ###########################################################################
     async def send_greeting(oai_ws):
-        """
-        Make the agent speak the exact greeting once.
-        IMPORTANT: Only do this after session.update is sent.
-        """
+        """Force exact greeting once."""
         nonlocal greeted, ai_busy
         if greeted:
             return
         greeted = True
         ai_busy = True
-
-        # We force it explicitly here.
         await oai_ws.send_json({
             "type": "response.create",
             "response": {
@@ -161,11 +142,8 @@ async def media(ws: WebSocket):
             }
         })
 
-    ###########################################################################
-    # Twilio -> OpenAI
-    ###########################################################################
     async def forward_twilio_to_openai(oai_ws, session_ready_evt: asyncio.Event):
-        nonlocal stream_sid, frames_since_commit, ai_busy
+        nonlocal stream_sid, caller_ulaw_bytes_since_commit, last_media_ts, caller_has_sent_any_audio, ai_busy
 
         while True:
             try:
@@ -189,26 +167,35 @@ async def media(ws: WebSocket):
                 call_sid = data["start"].get("callSid")
                 logging.info(f"📞 Twilio start: streamSid={stream_sid} callSid={call_sid}")
 
-                # Wait until OpenAI session.update is done before greeting
+                # Wait until session.update is done, then greet.
                 await session_ready_evt.wait()
                 await send_greeting(oai_ws)
 
             elif event == "media":
-                # Caller audio frame (base64 g711_ulaw)
                 ulaw_b64 = data["media"]["payload"]
 
-                # If AI is talking and caller starts speaking -> cancel AI immediately (barge-in)
-                # This stops rambling + prevents active response errors.
+                # mark time (used to detect silence gap)
+                last_media_ts = time.time()
+                caller_has_sent_any_audio = True
+
+                # If AI is talking and caller sends audio -> barge-in
                 if ai_busy:
                     await cancel_ai_response(oai_ws)
 
-                # Send audio directly to OpenAI in SAME format (g711_ulaw)
+                # Count bytes accurately: decode base64 to raw ulaw bytes
+                try:
+                    ulaw_bytes = base64.b64decode(ulaw_b64)
+                    caller_ulaw_bytes_since_commit += len(ulaw_bytes)
+                except Exception:
+                    # If decode fails, don’t commit based on it
+                    pass
+
+                # Send audio straight through to OpenAI (still base64)
                 try:
                     await oai_ws.send_json({
                         "type": "input_audio_buffer.append",
                         "audio": ulaw_b64,
                     })
-                    frames_since_commit += 1
                 except Exception:
                     logging.exception("⚠ error sending audio chunk to OpenAI")
 
@@ -218,9 +205,6 @@ async def media(ws: WebSocket):
 
         logging.info("🚪 forward_twilio_to_openai exiting")
 
-    ###########################################################################
-    # OpenAI -> Twilio
-    ###########################################################################
     async def forward_openai_to_twilio(oai_ws):
         nonlocal ai_busy, playback_running
 
@@ -236,7 +220,6 @@ async def media(ws: WebSocket):
                     continue
 
                 if oai_type == "response.audio.delta":
-                    # This is base64 audio in our output_audio_format (g711_ulaw)
                     delta_b64 = data.get("delta")
                     if delta_b64:
                         playback_queue.append(delta_b64)
@@ -258,34 +241,45 @@ async def media(ws: WebSocket):
         playback_running = False
         logging.info("🚪 forward_openai_to_twilio exiting")
 
-    ###########################################################################
-    # Drive loop: commit + ask model to respond after caller speaks enough
-    ###########################################################################
     async def speech_drive_loop(oai_ws):
-        nonlocal frames_since_commit, ai_busy
+        """
+        Commit only when:
+        - caller has provided >= MIN_BYTES_FOR_COMMIT, AND
+        - we have seen a silence gap (no media frames) for SILENCE_GAP_SECONDS, AND
+        - AI isn't already talking
+        """
+        nonlocal caller_ulaw_bytes_since_commit, ai_busy
 
         while playback_running:
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.10)
 
-            # Only create a response if:
-            # - caller has at least 100ms buffered
-            # - AI isn't currently speaking
-            if frames_since_commit >= MIN_FRAMES_FOR_COMMIT and not ai_busy:
-                try:
-                    ai_busy = True
-                    await oai_ws.send_json({"type": "input_audio_buffer.commit"})
-                    await oai_ws.send_json({
-                        "type": "response.create",
-                        "response": {
-                            "modalities": ["audio", "text"]
-                            # No extra instructions here; uses session instructions
-                        }
-                    })
-                except Exception:
-                    logging.exception("⚠ commit/response.create failed")
-                    ai_busy = False
+            if not caller_has_sent_any_audio:
+                continue  # don’t do anything before caller audio exists
 
-                frames_since_commit = 0
+            # If caller hasn't paused yet, don't commit
+            if last_media_ts and (time.time() - last_media_ts) < SILENCE_GAP_SECONDS:
+                continue
+
+            # If not enough audio, don't commit
+            if caller_ulaw_bytes_since_commit < MIN_BYTES_FOR_COMMIT:
+                continue
+
+            # If AI is busy, don't create a new response
+            if ai_busy:
+                continue
+
+            try:
+                ai_busy = True
+                await oai_ws.send_json({"type": "input_audio_buffer.commit"})
+                await oai_ws.send_json({
+                    "type": "response.create",
+                    "response": {"modalities": ["audio", "text"]}
+                })
+            except Exception:
+                logging.exception("⚠ commit/response.create failed")
+                ai_busy = False
+            finally:
+                caller_ulaw_bytes_since_commit = 0
 
     ###########################################################################
     # CONNECT to OpenAI Realtime
@@ -303,7 +297,6 @@ async def media(ws: WebSocket):
             ) as oai_ws:
                 logging.info("✅ Connected to OpenAI Realtime successfully!")
 
-                # Session config (IMPORTANT: audio+text, g711_ulaw in/out)
                 await oai_ws.send_json({
                     "type": "session.update",
                     "session": {
@@ -311,15 +304,12 @@ async def media(ws: WebSocket):
                         "input_audio_format": OAI_AUDIO_FORMAT,
                         "output_audio_format": OAI_AUDIO_FORMAT,
                         "voice": "alloy",
-
-                        # We'll manually trigger responses (so create_response False)
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.45,
                             "silence_duration_ms": 250,
                             "create_response": False
                         },
-
                         "instructions": (
                             "You are Riteway Landscape Products' phone assistant for a bulk landscape materials yard.\n"
                             "\n"
@@ -351,9 +341,6 @@ async def media(ws: WebSocket):
                             "- Premium Mulch: $44 per yard\n"
                             "- Colored Shredded Bark: $76 per yard\n"
                             "\n"
-                            "When giving a price, format like:\n"
-                            "\"Pea gravel is forty-two dollars per yard.\"\n"
-                            "\n"
                             "DELIVERY:\n"
                             "- Max 16 yards per load.\n"
                             "- $75 delivery fee to Grantsville.\n"
@@ -369,7 +356,6 @@ async def media(ws: WebSocket):
                             "- 1 cubic yard covers ~100 sq ft at ~3 inches deep.\n"
                             "- yards = (length_ft * width_ft * (depth_in/12)) / 27\n"
                             "- Round to 1 decimal place.\n"
-                            "If caller gives measurements, calculate yards and tell them how many loads (16 yd max).\n"
                             "\n"
                             "IMPORTANT:\n"
                             "- Do NOT talk about nurseries, succulents, flowers, or unrelated items.\n"
@@ -378,10 +364,8 @@ async def media(ws: WebSocket):
                     }
                 })
 
-                # Mark session ready so greeting can fire after Twilio "start"
                 session_ready_evt.set()
 
-                # Start tasks
                 playback_task = asyncio.create_task(playback_loop())
                 driver_task = asyncio.create_task(speech_drive_loop(oai_ws))
 
