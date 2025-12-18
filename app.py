@@ -11,19 +11,15 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
 
-###############################################################################
 # CONFIG
-###############################################################################
-
 PUBLIC_BASE_URL = "https://riteway-ai-agent.onrender.com"
-
 WS_MEDIA_URL = "wss://riteway-ai-agent.onrender.com/media"
 STREAM_STATUS_URL = "https://riteway-ai-agent.onrender.com/stream-status"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
 
-# Twilio Media Streams = G.711 u-law @ 8kHz
+# Twilio Media Streams use g711 μ‑law at 8 kHz.  OpenAI can accept it directly.
 OAI_AUDIO_FORMAT = "g711_ulaw"
 
 logging.basicConfig(level=logging.INFO)
@@ -55,9 +51,7 @@ async def health():
 
 @app.post("/stream-status")
 async def stream_status(req: Request):
-    """
-    Twilio will POST here with stream events + errors.
-    """
+    """Log Twilio stream status events for debugging."""
     body = await req.body()
     try:
         data = json.loads(body.decode("utf-8"))
@@ -68,17 +62,20 @@ async def stream_status(req: Request):
 
 @app.post("/voice", response_class=PlainTextResponse)
 async def voice(_: Request):
+    """
+    When a call comes in, Twilio hits this endpoint.
+    We respond with TwiML telling Twilio to stream audio to /media and post status.
+    The small greeting <Say> is optional; remove it later if not needed.
+    """
     logging.info("☎ Twilio hit /voice")
-
-    # Debug Say so we KNOW Twilio is executing the TwiML.
-    # You can remove later after everything is stable.
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Polly.Joanna">Hello, connecting you now.</Say>
-  <Pause length="0.4"/>
+  <Pause length="0.5"/>
   <Connect>
     <Stream
       url="{WS_MEDIA_URL}"
+      track="inbound_track"
       statusCallback="{STREAM_STATUS_URL}"
       statusCallbackMethod="POST"
     />
@@ -87,75 +84,67 @@ async def voice(_: Request):
     return PlainTextResponse(content=twiml, media_type="application/xml")
 
 ###############################################################################
-# /media
+# /media  (Twilio <-> us <-> OpenAI Realtime)
 ###############################################################################
 
 @app.websocket("/media")
 async def media(ws: WebSocket):
     """
-    Twilio Media Streams sometimes includes Sec-WebSocket-Protocol.
-    IMPORTANT: Only accept a subprotocol if the client requested one.
+    Handle the Twilio Media Stream WebSocket.
+    Forward incoming μ‑law audio to OpenAI and send the AI’s audio back to Twilio.
     """
-    requested = ws.headers.get("sec-websocket-protocol")
-    if requested:
-        offered = [p.strip() for p in requested.split(",") if p.strip()]
-        # Prefer "audio" if offered, else use first offered
-        chosen = "audio" if "audio" in offered else offered[0]
+    # Accept the WebSocket and honour any subprotocol if Twilio asked for one.
+    requested_proto = ws.headers.get("sec-websocket-protocol")
+    if requested_proto:
+        subprotocol = [p.strip() for p in requested_proto.split(",") if p.strip()][0]
         try:
-            await ws.accept(subprotocol=chosen)
-            logging.info(f"✅ Twilio connected to /media (accepted subprotocol={chosen})")
+            await ws.accept(subprotocol=subprotocol)
+            logging.info(f"✅ Twilio connected (accepted subprotocol={subprotocol})")
         except TypeError:
+            # If FastAPI/Starlette doesn’t support the argument, just accept
             await ws.accept()
-            logging.info("✅ Twilio connected to /media (server can't accept subprotocol arg)")
+            logging.info("✅ Twilio connected (without explicit subprotocol)")
     else:
         await ws.accept()
-        logging.info("✅ Twilio connected to /media (no subprotocol requested)")
+        logging.info("✅ Twilio connected (no subprotocol requested)")
 
     if not OPENAI_API_KEY:
-        logging.error("❌ No OPENAI_API_KEY set")
+        logging.error("❌ OPENAI_API_KEY not set")
         await ws.close()
         return
 
-    # Twilio streamSid (set on "start")
+    # Track Twilio’s stream ID and queue of AI audio to send back
     stream_sid = None
-
-    # AI->Twilio audio queue (base64 g711_ulaw chunks)
     playback_queue = deque()
 
-    # State flags
+    # Flags to manage call state
     playback_running = True
     ai_busy = False
     greeted = False
-
-    # Call lifecycle flags
     call_active = False
-    received_any_media = False
+    received_audio = False
 
-    # Commit gating
-    caller_ulaw_bytes_since_commit = 0
+    # Buffer control
+    caller_bytes_since_commit = 0
     last_media_ts = 0.0
-
-    # 8k ulaw = 8000 bytes/sec
-    # Require >= 250ms to avoid edge cases (OpenAI needs >=100ms)
-    MIN_BYTES_FOR_COMMIT = 2000
+    MIN_BYTES_FOR_COMMIT = 2000   # require ≈250ms of audio
     SILENCE_GAP_SECONDS = 0.45
 
     stop_evt = asyncio.Event()
 
-    # OpenAI readiness + greeting watchdog
+    # Events to manage OpenAI session ready/greeting state
     session_updated_evt = asyncio.Event()
     first_audio_delta_evt = asyncio.Event()
 
     async def safe_send_twilio(obj: dict):
+        """Safely send JSON back to Twilio (ignore failures)."""
         try:
             await ws.send_json(obj)
         except Exception:
             pass
 
     async def cancel_ai(oai_ws):
-        """
-        Cancel active AI response (barge-in) + clear queued audio.
-        """
+        """Cancel any active AI response and clear the playback queue."""
         nonlocal ai_busy
         playback_queue.clear()
         ai_busy = False
@@ -166,16 +155,16 @@ async def media(ws: WebSocket):
 
     async def playback_loop():
         """
-        Drip base64 g711_ulaw back to Twilio at ~20ms pacing.
+        Drip the AI’s μ‑law audio back to Twilio in ~20ms chunks.
         """
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)  # small startup delay
         while playback_running and not stop_evt.is_set():
             if playback_queue and stream_sid:
-                chunk_b64 = playback_queue.popleft()
+                chunk = playback_queue.popleft()
                 await safe_send_twilio({
                     "event": "media",
                     "streamSid": stream_sid,
-                    "media": {"payload": chunk_b64},
+                    "media": {"payload": chunk},
                 })
                 await asyncio.sleep(0.02)
             else:
@@ -183,58 +172,30 @@ async def media(ws: WebSocket):
 
     async def send_greeting(oai_ws):
         """
-        Say your exact greeting ONCE, only after session.updated confirmed.
-        Also includes a watchdog retry that is ALWAYS audio+text (never audio-only).
+        Send a single greeting after session.update completes.
+        Use the 'text' field to generate both text and audio.
         """
         nonlocal greeted, ai_busy
         if greeted or stop_evt.is_set():
             return
-
-        # Wait until OpenAI confirms session.update is active
         await session_updated_evt.wait()
-
         greeted = True
         ai_busy = True
-        logging.info("👋 Sending greeting response.create to OpenAI")
-
+        logging.info("👋 Sending greeting to OpenAI")
         await oai_ws.send_json({
             "type": "response.create",
             "response": {
-                "modalities": ["audio", "text"],
-                "voice": "alloy",  # IMPORTANT: set at response-time too
-                "instructions": "Say EXACTLY: Hello, thanks for calling Riteway Landscape Products! How can I help you?"
+                "text": "Hello, thanks for calling Riteway Landscape Products! How can I help you?"
             }
         })
 
-        async def watchdog():
-            nonlocal ai_busy
-            try:
-                await asyncio.wait_for(first_audio_delta_evt.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                if stop_evt.is_set():
-                    return
-                logging.warning("⚠ No response.audio.delta after greeting. Retrying greeting (audio+text).")
-                try:
-                    ai_busy = True
-                    await oai_ws.send_json({
-                        "type": "response.create",
-                        "response": {
-                            "modalities": ["audio", "text"],
-                            "voice": "alloy",
-                            "instructions": "Hello, thanks for calling Riteway Landscape Products! How can I help you?"
-                        }
-                    })
-                except Exception:
-                    pass
-
-        asyncio.create_task(watchdog())
-
     async def forward_twilio_to_openai(oai_ws):
         """
-        Twilio -> OpenAI
+        Read WebSocket messages from Twilio and forward audio to OpenAI.
+        Also detect start/stop events and handle barge‑ins.
         """
-        nonlocal stream_sid, call_active, received_any_media
-        nonlocal caller_ulaw_bytes_since_commit, last_media_ts, ai_busy
+        nonlocal stream_sid, call_active, received_audio
+        nonlocal caller_bytes_since_commit, last_media_ts, ai_busy
 
         while not stop_evt.is_set():
             try:
@@ -243,7 +204,7 @@ async def media(ws: WebSocket):
                 logging.info("❌ Twilio disconnected from /media")
                 break
             except Exception:
-                logging.exception("💥 Error receiving from Twilio WS")
+                logging.exception("💥 Error reading from Twilio WS")
                 break
 
             try:
@@ -258,41 +219,35 @@ async def media(ws: WebSocket):
                 call_sid = data["start"].get("callSid")
                 call_active = True
                 logging.info(f"📞 Twilio start: streamSid={stream_sid} callSid={call_sid}")
-
-                # Greet as soon as session.updated is confirmed
                 await send_greeting(oai_ws)
 
             elif event == "media":
                 if not call_active:
                     continue
-
-                received_any_media = True
+                received_audio = True
                 last_media_ts = time.time()
-
                 ulaw_b64 = data["media"]["payload"]
 
-                # Barge-in: if AI is talking and caller speaks, cancel AI
+                # If AI is talking and user speaks, cancel AI’s response (barge‑in)
                 if ai_busy:
                     await cancel_ai(oai_ws)
 
-                # Track bytes (decoded ulaw)
                 try:
                     ulaw_bytes = base64.b64decode(ulaw_b64)
-                    caller_ulaw_bytes_since_commit += len(ulaw_bytes)
+                    caller_bytes_since_commit += len(ulaw_bytes)
                 except Exception:
                     pass
 
-                # Send audio chunk to OpenAI (base64 ulaw)
                 try:
                     await oai_ws.send_json({
                         "type": "input_audio_buffer.append",
                         "audio": ulaw_b64,
                     })
                 except Exception:
-                    logging.exception("⚠ error sending audio chunk to OpenAI")
+                    logging.exception("⚠ Error sending audio to OpenAI")
 
             elif event == "stop":
-                logging.info("📴 Twilio sent stop (caller hung up)")
+                logging.info("📴 Twilio stop: caller hung up")
                 call_active = False
                 stop_evt.set()
                 await cancel_ai(oai_ws)
@@ -302,8 +257,7 @@ async def media(ws: WebSocket):
 
     async def forward_openai_to_twilio(oai_ws):
         """
-        OpenAI -> Twilio
-        Also logs text deltas so we can detect "text but no audio" situations.
+        Listen for events from OpenAI and queue AI audio to send back.
         """
         nonlocal ai_busy, playback_running
 
@@ -317,25 +271,19 @@ async def media(ws: WebSocket):
                 data = json.loads(raw.data)
                 oai_type = data.get("type")
 
-                # Log most events (helps debug silence)
+                # Log important events for debugging
                 if oai_type not in ("rate_limits.updated",):
                     logging.info(f"🤖 OAI event: {oai_type}")
 
                 if oai_type == "session.updated":
                     session_updated_evt.set()
-                    logging.info("✅ OpenAI session.updated received")
 
                 if oai_type == "response.audio.delta":
+                    # We have AI audio to play
                     first_audio_delta_evt.set()
                     delta_b64 = data.get("delta")
                     if delta_b64:
                         playback_queue.append(delta_b64)
-
-                elif oai_type == "response.output_text.delta":
-                    # Debug only: tells us if model is generating text but not audio
-                    delta = data.get("delta")
-                    if delta:
-                        logging.info(f"📝 OAI text delta: {delta}")
 
                 elif oai_type == "response.done":
                     ai_busy = False
@@ -357,48 +305,42 @@ async def media(ws: WebSocket):
 
     async def speech_drive_loop(oai_ws):
         """
-        Commit only when:
-        - caller has spoken
-        - we see a pause (silence gap)
-        - we have enough audio buffered (prevents commit_empty)
-        - AI is not currently busy
+        Decide when to commit the caller’s audio and ask the AI to respond.
         """
-        nonlocal caller_ulaw_bytes_since_commit, ai_busy
+        nonlocal caller_bytes_since_commit, ai_busy
 
         while not stop_evt.is_set():
-            await asyncio.sleep(0.10)
+            await asyncio.sleep(0.1)
 
-            if not call_active or not received_any_media:
+            if not call_active or not received_audio:
                 continue
 
-            # Require a pause
+            # Wait for a short pause (user stops talking)
             if last_media_ts and (time.time() - last_media_ts) < SILENCE_GAP_SECONDS:
                 continue
 
-            # Require enough audio
-            if caller_ulaw_bytes_since_commit < MIN_BYTES_FOR_COMMIT:
+            # Ensure we have at least ~250ms of audio before committing
+            if caller_bytes_since_commit < MIN_BYTES_FOR_COMMIT:
                 continue
 
-            # Don't overlap responses
+            # Only start a new response if the AI isn’t talking
             if ai_busy:
                 continue
 
             try:
                 ai_busy = True
-                logging.info(f"🗣 COMMIT {caller_ulaw_bytes_since_commit} ulaw bytes")
+                logging.info(f"🗣 Committing {caller_bytes_since_commit} μ‑law bytes")
                 await oai_ws.send_json({"type": "input_audio_buffer.commit"})
+                # Start the AI response (no modalities field: session settings apply)
                 await oai_ws.send_json({
                     "type": "response.create",
-                    "response": {
-                        "modalities": ["audio", "text"],
-                        "voice": "alloy",  # IMPORTANT: set at response-time too
-                    }
+                    "response": {}
                 })
             except Exception:
-                logging.exception("⚠ commit/response.create failed")
+                logging.exception("⚠ Error on commit/response.create")
                 ai_busy = False
             finally:
-                caller_ulaw_bytes_since_commit = 0
+                caller_bytes_since_commit = 0
 
     ###########################################################################
     # CONNECT TO OPENAI REALTIME
@@ -412,12 +354,12 @@ async def media(ws: WebSocket):
                     "OpenAI-Beta": "realtime=v1",
                 },
             ) as oai_ws:
-                logging.info("✅ Connected to OpenAI Realtime successfully!")
+                logging.info("✅ Connected to OpenAI Realtime")
 
-                # Start OpenAI listener immediately so we catch session.updated
-                oai_task = asyncio.create_task(forward_openai_to_twilio(oai_ws))
+                # Start OpenAI listener right away
+                oai_listener = asyncio.create_task(forward_openai_to_twilio(oai_ws))
 
-                # Configure the session
+                # Configure the session once at start
                 await oai_ws.send_json({
                     "type": "session.update",
                     "session": {
@@ -436,17 +378,16 @@ async def media(ws: WebSocket):
                             "Tone: warm, professional, firm. Short direct answers. If caller interrupts, stop.\n"
                             "Hours: Mon–Fri 9–5. No after hours.\n"
                             "We sell bulk by the yard; boulders by the ton.\n"
-                            "\n"
-                            "Pricing (always say 'per yard' or 'per ton'):\n"
+                            "Pricing:\n"
                             "- Washed Pea Gravel: $42 per yard\n"
-                            "- Desert Sun 7/8 Crushed Rock: $40 per yard\n"
-                            "- 7/8 Crushed Rock: $25 per yard\n"
-                            "- Desert Sun 1.5 Crushed Rock: $40 per yard\n"
-                            "- 1.5 Crushed Rock: $25 per yard\n"
+                            "- Desert Sun 7/8\" Crushed Rock: $40 per yard\n"
+                            "- 7/8\" Crushed Rock: $25 per yard\n"
+                            "- Desert Sun 1.5\" Crushed Rock: $40 per yard\n"
+                            "- 1.5\" Crushed Rock: $25 per yard\n"
                             "- Commercial Road Base: $20 per yard\n"
-                            "- 3/8 Minus Fines: $12 per yard\n"
-                            "- Desert Sun 1–3 Cobble: $40 per yard\n"
-                            "- 8 Landscape Cobble: $40 per yard\n"
+                            "- 3/8\" Minus Fines: $12 per yard\n"
+                            "- Desert Sun 1–3\" Cobble: $40 per yard\n"
+                            "- 8\" Landscape Cobble: $40 per yard\n"
                             "- Desert Sun Boulders: $75 per ton\n"
                             "- Fill Dirt: $12 per yard\n"
                             "- Top Soil: $26 per yard\n"
@@ -454,47 +395,44 @@ async def media(ws: WebSocket):
                             "- Washed Sand: $65 per yard\n"
                             "- Premium Mulch: $44 per yard\n"
                             "- Colored Shredded Bark: $76 per yard\n"
-                            "\n"
-                            "Delivery: max 16 yards per load. $75 Grantsville, $115 rest of Tooele Valley.\n"
-                            "Outside valley: ask address, repeat it, say $7/mile from Grantsville yard; confirm final total.\n"
-                            "\n"
-                            "Coverage: 1 yard ~100 sq ft at 3 inches. Formula yards=(L*W*(D/12))/27 round 1 decimal.\n"
-                            "Do NOT talk about nurseries/succulents/flowers.\n"
+                            "Delivery: max 16 yards per load. $75 Grantsville; $115 rest of Tooele Valley.\n"
+                            "Outside valley: ask address, repeat it, say $7 per mile from Grantsville yard; confirm final total.\n"
+                            "Coverage: 1 yard ~100 sq ft at 3 inches. Formula yards=(L*W*(D/12))/27, round to one decimal.\n"
+                            "Do NOT talk about nurseries, succulents, flowers or unrelated items.\n"
                         )
                     }
                 })
 
-                # Wait briefly for session.updated (so greeting doesn't race)
+                # Wait up to 3 seconds for session.updated; proceed anyway if missing
                 try:
                     await asyncio.wait_for(session_updated_evt.wait(), timeout=3.0)
+                    logging.info("✅ OpenAI session.updated received")
                 except asyncio.TimeoutError:
-                    logging.warning("⚠ Did not receive session.updated within 3s (continuing anyway)")
+                    logging.warning("⚠ Did not receive session.updated; continuing anyway")
 
+                # Start the playback and other loops
                 playback_task = asyncio.create_task(playback_loop())
                 twilio_task = asyncio.create_task(forward_twilio_to_openai(oai_ws))
                 driver_task = asyncio.create_task(speech_drive_loop(oai_ws))
 
-                # Run until Twilio task ends (hangup)
-                await twilio_task
+                # Wait until Twilio reading loops finish (call ends)
+                await asyncio.gather(twilio_task, driver_task)
 
+                # Stop everything and cancel tasks
                 stop_evt.set()
                 playback_task.cancel()
-                driver_task.cancel()
-                oai_task.cancel()
+                oai_listener.cancel()
 
         except Exception:
-            logging.exception("❌ Failed talking to OpenAI realtime. Check API key/billing/model access.")
+            logging.exception("❌ Failed connecting to OpenAI Realtime. Check API key or model access.")
 
+    # Close Twilio WebSocket
     try:
         await ws.close()
     except Exception:
         pass
 
     logging.info("🔚 /media connection closed")
-
-###############################################################################
-# LOCAL DEV
-###############################################################################
 
 if __name__ == "__main__":
     import uvicorn
