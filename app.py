@@ -146,8 +146,13 @@ async def media(ws: WebSocket):
     playback_running = True
     playback_task = None
 
-    # NEW: track when AI is currently speaking (so we can barge-in cancel safely)
+    # Track when AI is currently speaking (so we can barge-in cancel safely)
     ai_speaking = False
+
+    # NEW: debounce barge-in so tiny packets / comfort noise don’t cancel speech
+    BARGE_RMS_THRESHOLD = int(os.getenv("BARGE_RMS_THRESHOLD", "750"))  # raise to reduce sensitivity
+    BARGE_FRAMES_REQUIRED = int(os.getenv("BARGE_FRAMES_REQUIRED", "3"))  # 3 frames ≈ 60ms
+    barge_speech_frames = 0
 
     if not OPENAI_API_KEY:
         logging.error("❌ No OPENAI_API_KEY in environment.")
@@ -160,7 +165,7 @@ async def media(ws: WebSocket):
         every ~20ms so the caller hears smooth audio.
         """
         await asyncio.sleep(0.1)  # small delay so Twilio is fully ready
-        nonlocal playback_running
+        nonlocal playback_running, ai_speaking
         while playback_running:
             if playback_queue and stream_sid:
                 frame_b64 = playback_queue.popleft()
@@ -171,26 +176,46 @@ async def media(ws: WebSocket):
                 })
                 await asyncio.sleep(0.02)  # ~20ms per 160-byte μ-law frame
             else:
+                # If queue is empty, AI is no longer “actively speaking”
+                ai_speaking = False
                 await asyncio.sleep(0.005)
 
-    async def cancel_openai_response_if_speaking():
+    async def cancel_openai_response_if_real_speech(ulaw_bytes: bytes):
         """
-        NEW: If AI is speaking and caller starts talking, stop AI immediately.
-        This is the safest "normal conversation" behavior.
+        If AI is speaking and caller *actually* starts talking (not comfort noise),
+        stop AI and clear queued audio.
         """
-        nonlocal ai_speaking
-        if not oai_ws_handle:
-            return
-        if not ai_speaking:
+        nonlocal ai_speaking, barge_speech_frames
+
+        if not oai_ws_handle or not ai_speaking:
+            barge_speech_frames = 0
             return
 
-        # stop playing anything already queued to Twilio
+        # Compute energy on the incoming audio
+        try:
+            pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)
+            rms = audioop.rms(pcm16_8k, 2)
+        except Exception:
+            barge_speech_frames = 0
+            return
+
+        if rms >= BARGE_RMS_THRESHOLD:
+            barge_speech_frames += 1
+        else:
+            # decay quickly so it requires a continuous burst
+            barge_speech_frames = max(0, barge_speech_frames - 1)
+
+        if barge_speech_frames < BARGE_FRAMES_REQUIRED:
+            return
+
+        # We consider this “real barge-in”
+        barge_speech_frames = 0
         playback_queue.clear()
         ai_speaking = False
 
         try:
             await oai_ws_handle.send_json({"type": "response.cancel"})
-            logging.info("🛑 BARGE-IN: sent response.cancel to OpenAI")
+            logging.info(f"🛑 BARGE-IN: cancel (rms>={BARGE_RMS_THRESHOLD}, frames={BARGE_FRAMES_REQUIRED})")
         except Exception:
             pass
 
@@ -235,8 +260,8 @@ async def media(ws: WebSocket):
                 payload_b64 = data["media"]["payload"]
                 ulaw_bytes = base64.b64decode(payload_b64)
 
-                # NEW: if AI is currently speaking, cancel immediately (barge-in)
-                await cancel_openai_response_if_speaking()
+                # NEW: barge-in only on REAL speech energy for a short window
+                await cancel_openai_response_if_real_speech(ulaw_bytes)
 
                 # μ-law -> PCM16 @8kHz
                 pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)
@@ -289,7 +314,6 @@ async def media(ws: WebSocket):
                         ai_speaking = True
                         playback_queue.append(ulaw_chunk_b64)
 
-                # NOTE: newer events typically include response.done
                 elif oai_type in ("response.done", "response.completed"):
                     ai_speaking = False
                     logging.info("✅ AI finished a spoken response")
@@ -327,7 +351,6 @@ async def media(ws: WebSocket):
                 openai_connected = True
                 oai_ws_handle = oai_ws
 
-                # Tell OpenAI how to act on this call
                 await oai_ws.send_json({
                     "type": "session.update",
                     "session": {
@@ -341,7 +364,6 @@ async def media(ws: WebSocket):
                             "silence_duration_ms": 300,
                             "create_response": True
                         },
-                        # SAFE CHANGE: adjust role + keep your existing rules, but ensure Tammy + Riteway Landscape Products
                         "instructions": (
                             "You are Tammy, the live phone receptionist for Riteway Landscape Products.\n\n"
                             "TONE:\n"
@@ -349,7 +371,7 @@ async def media(ws: WebSocket):
                             "- Sound like a real dispatcher at a busy landscape yard.\n"
                             "- Be friendly and helpful, but also direct and firm.\n"
                             "- Keep each answer under 30 seconds.\n"
-                            "- If the caller starts talking, STOP immediately.\n\n"
+                            "- If the caller starts talking, stop and let them finish.\n\n"
                             "BUSINESS INFO:\n"
                             "- Business: Riteway Landscape Products.\n"
                             "- We sell bulk landscape material by the cubic yard.\n"
@@ -407,7 +429,7 @@ async def media(ws: WebSocket):
                     }
                 })
 
-                # SAFE CHANGE: Greeting exactly as requested (and ONLY this)
+                # Greeting exactly as requested (and ONLY this)
                 await oai_ws.send_json({
                     "type": "response.create",
                     "response": {
@@ -415,10 +437,8 @@ async def media(ws: WebSocket):
                     }
                 })
 
-                # Start the playback loop to drip audio back to Twilio
                 playback_task = asyncio.create_task(playback_loop())
 
-                # Run both pipelines (Twilio->OpenAI and OpenAI->Twilio) at the same time
                 await asyncio.gather(
                     forward_twilio_to_openai(oai_ws_handle),
                     forward_openai_to_twilio(oai_ws_handle),
@@ -429,10 +449,8 @@ async def media(ws: WebSocket):
                 "❌ Failed to connect to OpenAI Realtime! "
                 "Possible causes: invalid OPENAI_API_KEY or missing model access."
             )
-            # If OpenAI dies, still drain Twilio events so call ends clean
             await forward_twilio_to_openai(None)
 
-    # Cleanup playback loop
     playback_running = False
     if playback_task:
         await asyncio.sleep(0.1)
@@ -440,7 +458,6 @@ async def media(ws: WebSocket):
 
     logging.info("🔚 /media connection closed")
 
-# local dev entrypoint (Render normally calls uvicorn directly)
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
