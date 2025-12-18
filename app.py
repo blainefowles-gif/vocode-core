@@ -5,6 +5,7 @@ import base64
 import asyncio
 import logging
 import audioop
+import time  # ✅ NEW
 import numpy as np
 import aiohttp
 from collections import deque
@@ -149,9 +150,9 @@ async def media(ws: WebSocket):
     # Track when AI is currently speaking (so we can barge-in cancel safely)
     ai_speaking = False
 
-    # NEW: debounce barge-in so tiny packets / comfort noise don’t cancel speech
-    BARGE_RMS_THRESHOLD = int(os.getenv("BARGE_RMS_THRESHOLD", "750"))  # raise to reduce sensitivity
-    BARGE_FRAMES_REQUIRED = int(os.getenv("BARGE_FRAMES_REQUIRED", "3"))  # 3 frames ≈ 60ms
+    # Debounce barge-in so tiny packets / comfort noise don’t cancel speech
+    BARGE_RMS_THRESHOLD = int(os.getenv("BARGE_RMS_THRESHOLD", "750"))
+    BARGE_FRAMES_REQUIRED = int(os.getenv("BARGE_FRAMES_REQUIRED", "3"))
     barge_speech_frames = 0
 
     if not OPENAI_API_KEY:
@@ -174,9 +175,8 @@ async def media(ws: WebSocket):
                     "streamSid": stream_sid,
                     "media": {"payload": frame_b64},
                 })
-                await asyncio.sleep(0.02)  # ~20ms per 160-byte μ-law frame
+                await asyncio.sleep(0.02)
             else:
-                # If queue is empty, AI is no longer “actively speaking”
                 ai_speaking = False
                 await asyncio.sleep(0.005)
 
@@ -191,7 +191,6 @@ async def media(ws: WebSocket):
             barge_speech_frames = 0
             return
 
-        # Compute energy on the incoming audio
         try:
             pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)
             rms = audioop.rms(pcm16_8k, 2)
@@ -202,13 +201,11 @@ async def media(ws: WebSocket):
         if rms >= BARGE_RMS_THRESHOLD:
             barge_speech_frames += 1
         else:
-            # decay quickly so it requires a continuous burst
             barge_speech_frames = max(0, barge_speech_frames - 1)
 
         if barge_speech_frames < BARGE_FRAMES_REQUIRED:
             return
 
-        # We consider this “real barge-in”
         barge_speech_frames = 0
         playback_queue.clear()
         ai_speaking = False
@@ -220,11 +217,6 @@ async def media(ws: WebSocket):
             pass
 
     async def forward_twilio_to_openai(oai_ws):
-        """
-        1. Read incoming 'media' events from Twilio = caller's voice.
-        2. Convert μ-law 8kHz -> PCM16 24kHz.
-        3. Send audio to OpenAI as input_audio_buffer.append.
-        """
         nonlocal stream_sid
         nonlocal openai_connected
         nonlocal oai_ws_handle
@@ -256,20 +248,14 @@ async def media(ws: WebSocket):
                 logging.info(f"📞 Twilio start: streamSid={stream_sid} callSid={call_sid}")
 
             elif event == "media":
-                # Caller audio chunk
                 payload_b64 = data["media"]["payload"]
                 ulaw_bytes = base64.b64decode(payload_b64)
 
-                # NEW: barge-in only on REAL speech energy for a short window
                 await cancel_openai_response_if_real_speech(ulaw_bytes)
 
-                # μ-law -> PCM16 @8kHz
                 pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)
-
-                # upsample 8k -> 24k (OpenAI expects 24k PCM16)
                 pcm16_24k, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 24000, None)
 
-                # forward to OpenAI
                 if oai_ws and openai_connected:
                     try:
                         b64_for_openai = base64.b64encode(pcm16_24k).decode("ascii")
@@ -290,10 +276,6 @@ async def media(ws: WebSocket):
         logging.info("🚪 forward_twilio_to_openai exiting")
 
     async def forward_openai_to_twilio(oai_ws):
-        """
-        Read streamed events from OpenAI.
-        On response.audio.delta -> push μ-law chunk to playback_queue.
-        """
         nonlocal openai_connected
         nonlocal ai_speaking
 
@@ -306,7 +288,7 @@ async def media(ws: WebSocket):
                 oai_type = data.get("type")
                 logging.info(f"🤖 OAI event: {oai_type}")
 
-                openai_connected = True  # we heard from OpenAI
+                openai_connected = True
 
                 if oai_type == "response.audio.delta":
                     ulaw_chunk_b64 = data.get("delta")
@@ -331,7 +313,6 @@ async def media(ws: WebSocket):
             logging.exception("💥 Error while reading from OpenAI ws (forward_openai_to_twilio)")
         logging.info("🚪 forward_openai_to_twilio exiting")
 
-    # MAIN: connect to OpenAI Realtime
     if not OPENAI_API_KEY:
         logging.error("❌ OPENAI_API_KEY missing. Skipping OpenAI connect.")
         await forward_twilio_to_openai(None)
@@ -351,6 +332,7 @@ async def media(ws: WebSocket):
                 openai_connected = True
                 oai_ws_handle = oai_ws
 
+                # Session behavior
                 await oai_ws.send_json({
                     "type": "session.update",
                     "session": {
@@ -365,21 +347,20 @@ async def media(ws: WebSocket):
                             "create_response": True
                         },
                         "instructions": (
-                            "You are Tammy, the live phone receptionist for Riteway Landscape Products.\n\n"
+                            "You are Tammy, the live phone receptionist for Riteway Landscape Products.\n"
+                            "You are speaking to callers on the phone.\n"
+                            "Never talk as if you are the caller.\n"
+                            "If you greet, greet the caller (do not greet Tammy).\n\n"
                             "TONE:\n"
                             "- Speak warm, professional, confident, and efficient.\n"
-                            "- Sound like a real dispatcher at a busy landscape yard.\n"
-                            "- Be friendly and helpful, but also direct and firm.\n"
                             "- Keep each answer under 30 seconds.\n"
                             "- If the caller starts talking, stop and let them finish.\n\n"
                             "BUSINESS INFO:\n"
                             "- Business: Riteway Landscape Products.\n"
                             "- We sell bulk landscape material by the cubic yard.\n"
                             "- We are open Monday–Friday, 9 AM to 5 PM. No after-hours or weekend scheduling.\n"
-                            "- We mainly serve Tooele Valley and surrounding areas.\n"
-                            "- Most callers already know which product they want and how many yards.\n\n"
+                            "- We mainly serve Tooele Valley and surrounding areas.\n\n"
                             "PRICING (ALWAYS say 'per yard' or 'per ton'):\n"
-                            "ROCK (price per yard unless noted):\n"
                             "- Washed Pea Gravel: $42 per yard.\n"
                             "- Desert Sun 7/8\" Crushed Rock: $40 per yard.\n"
                             "- 7/8\" Crushed Rock: $25 per yard.\n"
@@ -389,51 +370,54 @@ async def media(ws: WebSocket):
                             "- 3/8\" Minus Fines: $12 per yard.\n"
                             "- Desert Sun 1–3\" Cobble: $40 per yard.\n"
                             "- 8\" Landscape Cobble: $40 per yard.\n"
-                            "- Desert Sun Boulders: $75 per ton (not per yard).\n\n"
-                            "DIRT / SOIL / SAND (price per yard):\n"
+                            "- Desert Sun Boulders: $75 per ton.\n"
                             "- Fill Dirt: $12 per yard.\n"
                             "- Top Soil: $26 per yard.\n"
                             "- Screened Premium Top Soil: $40 per yard.\n"
-                            "- Washed Sand: $65 per yard.\n\n"
-                            "BARK / MULCH (price per yard):\n"
+                            "- Washed Sand: $65 per yard.\n"
                             "- Premium Mulch: $44 per yard.\n"
                             "- Colored Shredded Bark: $76 per yard.\n\n"
-                            "DELIVERY RULES:\n"
-                            "- We can haul up to 16 yards per load. If they need more than 16 yards, that's multiple loads.\n"
-                            "- Delivery pricing inside Tooele Valley:\n"
-                            "  - $75 delivery fee to Grantsville.\n"
-                            "  - $115 delivery fee to the rest of Tooele Valley (Tooele, Stansbury, etc.).\n"
-                            "- For deliveries OUTSIDE Tooele Valley (for example Magna):\n"
-                            "  1. Ask for the full delivery address.\n"
-                            "  2. Repeat the address back and confirm it's correct.\n"
-                            "  3. Tell them: 'We charge $7 per mile from our yard in Grantsville, Utah.'\n"
-                            "  4. Say: 'We'll confirm the final total when dispatch calls you back.'\n\n"
-                            "BOOKING / TAKING AN ORDER:\n"
-                            "If they want to schedule a delivery or place an order, gather:\n"
-                            "1. Material they want.\n"
-                            "2. How many yards they want (remind them: up to 16 yards per load).\n"
-                            "3. Delivery address.\n"
-                            "4. When they want it delivered.\n"
-                            "5. Their name and callback number.\n"
-                            "After you get that info, tell them: 'We'll confirm timing and reach back out to lock this in.'\n\n"
-                            "COVERAGE / YARDAGE ESTIMATES:\n"
-                            "- One cubic yard of material covers roughly 100 square feet at about 3 inches deep.\n"
-                            "- Compute: yards_needed = (length_ft * width_ft * depth_inches / 12) / 27.\n"
-                            "- Round to one decimal place.\n\n"
-                            "POLICY / WHAT NOT TO DO:\n"
-                            "- Do NOT promise exact arrival times.\n"
-                            "- Do NOT offer after-hours or weekend service.\n"
-                            "- Do NOT invent products or prices.\n"
-                            "- If you're not sure, collect their info and say someone will call them back.\n"
+                            "DELIVERY:\n"
+                            "- Up to 16 yards per load.\n"
+                            "- $75 to Grantsville.\n"
+                            "- $115 to rest of Tooele Valley.\n"
+                            "- Outside valley: ask address, repeat it, say $7/mile from Grantsville yard; dispatch confirms total.\n"
                         )
                     }
                 })
 
-                # Greeting exactly as requested (and ONLY this)
+                # ✅ NEW: Wait for session.updated BEFORE greeting (prevents “role swap” weirdness)
+                session_updated = False
+                start = time.time()
+                while time.time() - start < 2.0:
+                    try:
+                        msg = await oai_ws.receive(timeout=2.0)
+                    except Exception:
+                        break
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    try:
+                        data = json.loads(msg.data)
+                    except Exception:
+                        continue
+                    t = data.get("type")
+                    logging.info(f"🤖 OAI event (pre-loop): {t}")
+                    if t == "session.updated":
+                        session_updated = True
+                        break
+                if not session_updated:
+                    logging.warning("⚠ Did not confirm session.updated before greeting (continuing anyway).")
+
+                # ✅ Hard-locked greeting (exact words, nothing else)
                 await oai_ws.send_json({
                     "type": "response.create",
                     "response": {
-                        "instructions": "Hey, I’m Tammy with Riteway Landscape Products. How can I help you?"
+                        "modalities": ["audio", "text"],
+                        "instructions": (
+                            "You are speaking to the caller. "
+                            "Say EXACTLY and ONLY this sentence, then stop: "
+                            "Hey, I’m Tammy with Riteway Landscape Products. How can I help you?"
+                        )
                     }
                 })
 
