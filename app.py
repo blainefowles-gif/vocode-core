@@ -139,18 +139,34 @@ async def media(ws: WebSocket):
     ai_speaking = False
 
     # -------------------------
-    # BARGE-IN TUNING (ENV)
+    # BARGE-IN (FAST + ROBUST)
     # -------------------------
-    # RMS-only is not enough; we add Peak + ZCR + Cooldown for "seamless" behavior.
-    BARGE_RMS_THRESHOLD = int(os.getenv("BARGE_RMS_THRESHOLD", "750"))     # raise => less sensitive
-    BARGE_FRAMES_REQUIRED = int(os.getenv("BARGE_FRAMES_REQUIRED", "3"))   # 3 frames ~ 60ms
-    BARGE_PEAK_MIN = int(os.getenv("BARGE_PEAK_MIN", "2500"))             # helps ignore soft noise
-    BARGE_ZCR_MIN = float(os.getenv("BARGE_ZCR_MIN", "0.04"))             # steady hum is often lower
-    BARGE_ZCR_MAX = float(os.getenv("BARGE_ZCR_MAX", "0.20"))             # harsh hiss can be higher
-    BARGE_CANCEL_COOLDOWN_MS = int(os.getenv("BARGE_CANCEL_COOLDOWN_MS", "250"))
+    # Key fixes for the “~3 second delay”:
+    # 1) Send Twilio "clear" immediately on barge-in (flushes Twilio jitter/playout buffer)
+    # 2) Use an adaptive noise floor (so we ignore background noise but trigger quickly on real speech)
+    # 3) Lower required frames by default + add a fast-trigger for obvious speech
+    #
+    # You can still override any of these with Render env vars.
+    BARGE_RMS_MIN = int(os.getenv("BARGE_RMS_MIN", "650"))                 # absolute floor
+    BARGE_NOISE_MULT = float(os.getenv("BARGE_NOISE_MULT", "3.0"))         # noise * mult -> threshold
+    BARGE_FRAMES_REQUIRED = int(os.getenv("BARGE_FRAMES_REQUIRED", "2"))   # 2 frames ~ 40ms
+    BARGE_PEAK_MIN = int(os.getenv("BARGE_PEAK_MIN", "2200"))              # ignore very soft hum
+    BARGE_FAST_TRIGGER_RATIO = float(os.getenv("BARGE_FAST_TRIGGER_RATIO", "1.8"))  # instant if rms > thr*ratio
+    BARGE_CANCEL_COOLDOWN_MS = int(os.getenv("BARGE_CANCEL_COOLDOWN_MS", "120"))
+
+    # Optional ZCR gate (off by default; ZCR can be device-dependent)
+    BARGE_USE_ZCR = os.getenv("BARGE_USE_ZCR", "0") == "1"
+    BARGE_ZCR_MIN = float(os.getenv("BARGE_ZCR_MIN", "0.02"))
+    BARGE_ZCR_MAX = float(os.getenv("BARGE_ZCR_MAX", "0.22"))
 
     barge_speech_frames = 0
     last_cancel_ts = 0.0
+
+    # Adaptive noise floor (EMA)
+    noise_rms_ema = float(os.getenv("NOISE_RMS_INIT", "200"))  # starting guess
+    NOISE_EMA_ALPHA = float(os.getenv("NOISE_EMA_ALPHA", "0.05"))
+    NOISE_UPDATE_RMS_CAP = int(os.getenv("NOISE_UPDATE_RMS_CAP", "900"))   # don't learn on loud speech
+    NOISE_UPDATE_WHEN_AI_SPEAKING = os.getenv("NOISE_UPDATE_WHEN_AI_SPEAKING", "0") == "1"
 
     if not OPENAI_API_KEY:
         logging.error("❌ No OPENAI_API_KEY in environment.")
@@ -173,15 +189,36 @@ async def media(ws: WebSocket):
                 ai_speaking = False
                 await asyncio.sleep(0.005)
 
-    async def cancel_openai_response_if_real_speech(ulaw_bytes: bytes):
+    async def twilio_clear_audio():
         """
-        Seamless barge-in:
-        - Only cancels if AI is speaking
-        - Requires sustained speech-like audio (RMS + Peak + ZCR window)
-        - Cooldown prevents repeated cancel spam
+        Ask Twilio to immediately flush any buffered outbound audio.
+        This is what removes that “keeps talking for seconds” feeling.
         """
-        nonlocal ai_speaking, barge_speech_frames, last_cancel_ts
+        if not stream_sid:
+            return
+        try:
+            await ws.send_json({"event": "clear", "streamSid": stream_sid})
+        except Exception:
+            pass
 
+    async def cancel_openai_response_if_real_speech(ulaw_bytes: bytes):
+        nonlocal ai_speaking, barge_speech_frames, last_cancel_ts, noise_rms_ema
+
+        # Always compute RMS/Peak so we can keep learning the noise floor (when appropriate)
+        try:
+            pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)
+            rms = audioop.rms(pcm16_8k, 2)
+            peak = audioop.max(pcm16_8k, 2)
+        except Exception:
+            barge_speech_frames = 0
+            return
+
+        # Update noise floor when not speaking (or if you explicitly allow learning during AI speech)
+        can_learn_noise = (not ai_speaking) or NOISE_UPDATE_WHEN_AI_SPEAKING
+        if can_learn_noise and rms <= NOISE_UPDATE_RMS_CAP:
+            noise_rms_ema = (1.0 - NOISE_EMA_ALPHA) * noise_rms_ema + NOISE_EMA_ALPHA * float(rms)
+
+        # If AI isn't speaking, don't barge-cancel anything.
         if not oai_ws_handle or not ai_speaking:
             barge_speech_frames = 0
             return
@@ -190,29 +227,30 @@ async def media(ws: WebSocket):
         if (now - last_cancel_ts) * 1000 < BARGE_CANCEL_COOLDOWN_MS:
             return
 
-        try:
-            pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)
-            rms = audioop.rms(pcm16_8k, 2)
-            peak = audioop.max(pcm16_8k, 2)
+        # Dynamic threshold derived from noise floor + absolute floor
+        dyn_thr = max(BARGE_RMS_MIN, int(noise_rms_ema * BARGE_NOISE_MULT))
 
-            samples = np.frombuffer(pcm16_8k, dtype=np.int16)
-            if samples.size < 2:
-                barge_speech_frames = 0
-                return
+        # Optional ZCR test (off by default)
+        zcr_ok = True
+        zcr_val = None
+        if BARGE_USE_ZCR:
+            try:
+                samples = np.frombuffer(pcm16_8k, dtype=np.int16)
+                if samples.size >= 2:
+                    signs = np.sign(samples)
+                    zcr_val = float(np.mean(signs[1:] != signs[:-1]))
+                    zcr_ok = (BARGE_ZCR_MIN <= zcr_val <= BARGE_ZCR_MAX)
+            except Exception:
+                zcr_ok = False
 
-            signs = np.sign(samples)
-            zcr = float(np.mean(signs[1:] != signs[:-1]))
-        except Exception:
-            barge_speech_frames = 0
-            return
+        speech_like = (rms >= dyn_thr) and (peak >= BARGE_PEAK_MIN) and zcr_ok
 
-        speech_like = (
-            (rms >= BARGE_RMS_THRESHOLD) and
-            (peak >= BARGE_PEAK_MIN) and
-            (BARGE_ZCR_MIN <= zcr <= BARGE_ZCR_MAX)
-        )
+        # Fast trigger: if it's clearly above threshold, cancel immediately (no multi-frame wait)
+        fast_trigger = (rms >= int(dyn_thr * BARGE_FAST_TRIGGER_RATIO)) and (peak >= int(BARGE_PEAK_MIN * 1.1))
 
-        if speech_like:
+        if fast_trigger:
+            barge_speech_frames = BARGE_FRAMES_REQUIRED
+        elif speech_like:
             barge_speech_frames += 1
         else:
             barge_speech_frames = max(0, barge_speech_frames - 1)
@@ -220,20 +258,28 @@ async def media(ws: WebSocket):
         if barge_speech_frames < BARGE_FRAMES_REQUIRED:
             return
 
-        # Confirmed barge-in
+        # Confirmed barge-in: stop audio NOW
         barge_speech_frames = 0
         playback_queue.clear()
         ai_speaking = False
         last_cancel_ts = now
 
+        # Critical: flush Twilio playout buffer
+        await twilio_clear_audio()
+
+        # Stop OpenAI response generation
         try:
             await oai_ws_handle.send_json({"type": "response.cancel"})
-            logging.info(
-                f"🛑 BARGE-IN: cancel (rms={rms}, peak={peak}, zcr={zcr:.3f}, "
-                f"thr={BARGE_RMS_THRESHOLD}, peak_min={BARGE_PEAK_MIN}, frames={BARGE_FRAMES_REQUIRED})"
-            )
         except Exception:
             pass
+
+        logging.info(
+            f"🛑 BARGE-IN: cancel (rms={rms}, peak={peak}, dyn_thr={dyn_thr}, "
+            f"noise_ema={noise_rms_ema:.1f}, frames={BARGE_FRAMES_REQUIRED}, "
+            f"fast={fast_trigger}, zcr={'on' if BARGE_USE_ZCR else 'off'}"
+            f"{'' if zcr_val is None else f', zcr={zcr_val:.3f}'}"
+            f")"
+        )
 
     async def forward_twilio_to_openai(oai_ws):
         nonlocal stream_sid
@@ -427,7 +473,7 @@ async def media(ws: WebSocket):
                     }
                 })
 
-                # Wait briefly for session.updated before greeting (keeps behavior stable)
+                # Wait briefly for session.updated before greeting
                 session_updated = False
                 start = time.time()
                 while time.time() - start < 2.0:
