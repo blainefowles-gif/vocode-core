@@ -114,12 +114,6 @@ async def health():
 
 @app.post("/voice", response_class=PlainTextResponse)
 async def voice(_: Request):
-    """
-    Twilio calls this first.
-    We return TwiML that IMMEDIATELY starts streaming the call audio
-    to our /media WebSocket. We REMOVED the Twilio <Say> so callers
-    do NOT hear 'Connecting you...' first.
-    """
     logging.info("☎ Twilio hit /voice")
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -131,10 +125,6 @@ async def voice(_: Request):
 
 @app.websocket("/media")
 async def media(ws: WebSocket):
-    """
-    Live call bridge:
-      Twilio <-> (this server) <-> OpenAI Realtime Voice API
-    """
     await ws.accept()
     logging.info("✅ Twilio connected to /media")
 
@@ -142,15 +132,12 @@ async def media(ws: WebSocket):
     openai_connected = False
     oai_ws_handle = None
 
-    # μ-law audio chunks from OpenAI waiting to go back to Twilio
     playback_queue = deque()
     playback_running = True
     playback_task = None
 
-    # Track when AI is currently speaking (so we can barge-in cancel safely)
     ai_speaking = False
 
-    # Debounce barge-in so tiny packets / comfort noise don’t cancel speech
     BARGE_RMS_THRESHOLD = int(os.getenv("BARGE_RMS_THRESHOLD", "750"))
     BARGE_FRAMES_REQUIRED = int(os.getenv("BARGE_FRAMES_REQUIRED", "3"))
     barge_speech_frames = 0
@@ -161,11 +148,7 @@ async def media(ws: WebSocket):
         logging.info("🔑 OPENAI_API_KEY is present")
 
     async def playback_loop():
-        """
-        Take μ-law frames from playback_queue and drip them to Twilio
-        every ~20ms so the caller hears smooth audio.
-        """
-        await asyncio.sleep(0.1)  # small delay so Twilio is fully ready
+        await asyncio.sleep(0.1)
         nonlocal playback_running, ai_speaking
         while playback_running:
             if playback_queue and stream_sid:
@@ -181,10 +164,6 @@ async def media(ws: WebSocket):
                 await asyncio.sleep(0.005)
 
     async def cancel_openai_response_if_real_speech(ulaw_bytes: bytes):
-        """
-        If AI is speaking and caller *actually* starts talking (not comfort noise),
-        stop AI and clear queued audio.
-        """
         nonlocal ai_speaking, barge_speech_frames
 
         if not oai_ws_handle or not ai_speaking:
@@ -332,7 +311,6 @@ async def media(ws: WebSocket):
                 openai_connected = True
                 oai_ws_handle = oai_ws
 
-                # Session behavior
                 await oai_ws.send_json({
                     "type": "session.update",
                     "session": {
@@ -347,19 +325,38 @@ async def media(ws: WebSocket):
                             "create_response": True
                         },
                         "instructions": (
+                            # ✅ NEW: language + scope lock + “no show your work”
+                            "LANGUAGE:\n"
+                            "- Speak ENGLISH only. Do not switch languages.\n\n"
+
+                            "ROLE:\n"
                             "You are Tammy, the live phone receptionist for Riteway Landscape Products.\n"
                             "You are speaking to callers on the phone.\n"
                             "Never talk as if you are the caller.\n"
                             "If you greet, greet the caller (do not greet Tammy).\n\n"
-                            "TONE:\n"
+
+                            "SCOPE (IMPORTANT):\n"
+                            "- You are NOT a general purpose assistant.\n"
+                            "- ONLY answer questions related to Riteway Landscape Products and landscape materials.\n"
+                            "- Allowed topics: product/pricing, delivery areas/fees, scheduling within business hours,\n"
+                            "  loading limits (16 yards), and yardage/material estimates for landscaping.\n"
+                            "- If asked about anything else (history, trivia, politics, random questions, etc.),\n"
+                            "  politely refuse and redirect back to landscape materials.\n"
+                            "  Example refusal: \"I can only help with Riteway landscape materials, pricing, delivery, or yardage estimates. What material are you working with?\"\n\n"
+
+                            "STYLE:\n"
                             "- Speak warm, professional, confident, and efficient.\n"
                             "- Keep each answer under 30 seconds.\n"
-                            "- If the caller starts talking, stop and let them finish.\n\n"
+                            "- If the caller starts talking, stop and let them finish.\n"
+                            "- When doing calculations, do NOT explain your steps or reasoning.\n"
+                            "  Give ONLY the final result and one short helpful sentence.\n\n"
+
                             "BUSINESS INFO:\n"
                             "- Business: Riteway Landscape Products.\n"
                             "- We sell bulk landscape material by the cubic yard.\n"
                             "- We are open Monday–Friday, 9 AM to 5 PM. No after-hours or weekend scheduling.\n"
                             "- We mainly serve Tooele Valley and surrounding areas.\n\n"
+
                             "PRICING (ALWAYS say 'per yard' or 'per ton'):\n"
                             "- Washed Pea Gravel: $42 per yard.\n"
                             "- Desert Sun 7/8\" Crushed Rock: $40 per yard.\n"
@@ -377,16 +374,20 @@ async def media(ws: WebSocket):
                             "- Washed Sand: $65 per yard.\n"
                             "- Premium Mulch: $44 per yard.\n"
                             "- Colored Shredded Bark: $76 per yard.\n\n"
+
                             "DELIVERY:\n"
                             "- Up to 16 yards per load.\n"
                             "- $75 to Grantsville.\n"
                             "- $115 to rest of Tooele Valley.\n"
-                            "- Outside valley: ask address, repeat it, say $7/mile from Grantsville yard; dispatch confirms total.\n"
+                            "- Outside valley: ask address, repeat it, say $7/mile from Grantsville yard; dispatch confirms total.\n\n"
+
+                            "YARDAGE ESTIMATES (no step-by-step):\n"
+                            "- Use: yards = (L_ft * W_ft * (D_in/12)) / 27, rounded to 1 decimal.\n"
+                            "- Also: 1 yard covers ~100 sq ft at ~3 inches.\n"
                         )
                     }
                 })
 
-                # ✅ NEW: Wait for session.updated BEFORE greeting (prevents “role swap” weirdness)
                 session_updated = False
                 start = time.time()
                 while time.time() - start < 2.0:
@@ -408,7 +409,6 @@ async def media(ws: WebSocket):
                 if not session_updated:
                     logging.warning("⚠ Did not confirm session.updated before greeting (continuing anyway).")
 
-                # ✅ Hard-locked greeting (exact words, nothing else)
                 await oai_ws.send_json({
                     "type": "response.create",
                     "response": {
