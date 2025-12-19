@@ -5,7 +5,7 @@ import base64
 import asyncio
 import logging
 import audioop
-import time  # ✅ NEW
+import time
 import numpy as np
 import aiohttp
 from collections import deque
@@ -138,9 +138,19 @@ async def media(ws: WebSocket):
 
     ai_speaking = False
 
-    BARGE_RMS_THRESHOLD = int(os.getenv("BARGE_RMS_THRESHOLD", "750"))
-    BARGE_FRAMES_REQUIRED = int(os.getenv("BARGE_FRAMES_REQUIRED", "3"))
+    # -------------------------
+    # BARGE-IN TUNING (ENV)
+    # -------------------------
+    # RMS-only is not enough; we add Peak + ZCR + Cooldown for "seamless" behavior.
+    BARGE_RMS_THRESHOLD = int(os.getenv("BARGE_RMS_THRESHOLD", "750"))     # raise => less sensitive
+    BARGE_FRAMES_REQUIRED = int(os.getenv("BARGE_FRAMES_REQUIRED", "3"))   # 3 frames ~ 60ms
+    BARGE_PEAK_MIN = int(os.getenv("BARGE_PEAK_MIN", "2500"))             # helps ignore soft noise
+    BARGE_ZCR_MIN = float(os.getenv("BARGE_ZCR_MIN", "0.04"))             # steady hum is often lower
+    BARGE_ZCR_MAX = float(os.getenv("BARGE_ZCR_MAX", "0.20"))             # harsh hiss can be higher
+    BARGE_CANCEL_COOLDOWN_MS = int(os.getenv("BARGE_CANCEL_COOLDOWN_MS", "250"))
+
     barge_speech_frames = 0
+    last_cancel_ts = 0.0
 
     if not OPENAI_API_KEY:
         logging.error("❌ No OPENAI_API_KEY in environment.")
@@ -164,20 +174,45 @@ async def media(ws: WebSocket):
                 await asyncio.sleep(0.005)
 
     async def cancel_openai_response_if_real_speech(ulaw_bytes: bytes):
-        nonlocal ai_speaking, barge_speech_frames
+        """
+        Seamless barge-in:
+        - Only cancels if AI is speaking
+        - Requires sustained speech-like audio (RMS + Peak + ZCR window)
+        - Cooldown prevents repeated cancel spam
+        """
+        nonlocal ai_speaking, barge_speech_frames, last_cancel_ts
 
         if not oai_ws_handle or not ai_speaking:
             barge_speech_frames = 0
             return
 
+        now = time.time()
+        if (now - last_cancel_ts) * 1000 < BARGE_CANCEL_COOLDOWN_MS:
+            return
+
         try:
             pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)
             rms = audioop.rms(pcm16_8k, 2)
+            peak = audioop.max(pcm16_8k, 2)
+
+            samples = np.frombuffer(pcm16_8k, dtype=np.int16)
+            if samples.size < 2:
+                barge_speech_frames = 0
+                return
+
+            signs = np.sign(samples)
+            zcr = float(np.mean(signs[1:] != signs[:-1]))
         except Exception:
             barge_speech_frames = 0
             return
 
-        if rms >= BARGE_RMS_THRESHOLD:
+        speech_like = (
+            (rms >= BARGE_RMS_THRESHOLD) and
+            (peak >= BARGE_PEAK_MIN) and
+            (BARGE_ZCR_MIN <= zcr <= BARGE_ZCR_MAX)
+        )
+
+        if speech_like:
             barge_speech_frames += 1
         else:
             barge_speech_frames = max(0, barge_speech_frames - 1)
@@ -185,13 +220,18 @@ async def media(ws: WebSocket):
         if barge_speech_frames < BARGE_FRAMES_REQUIRED:
             return
 
+        # Confirmed barge-in
         barge_speech_frames = 0
         playback_queue.clear()
         ai_speaking = False
+        last_cancel_ts = now
 
         try:
             await oai_ws_handle.send_json({"type": "response.cancel"})
-            logging.info(f"🛑 BARGE-IN: cancel (rms>={BARGE_RMS_THRESHOLD}, frames={BARGE_FRAMES_REQUIRED})")
+            logging.info(
+                f"🛑 BARGE-IN: cancel (rms={rms}, peak={peak}, zcr={zcr:.3f}, "
+                f"thr={BARGE_RMS_THRESHOLD}, peak_min={BARGE_PEAK_MIN}, frames={BARGE_FRAMES_REQUIRED})"
+            )
         except Exception:
             pass
 
@@ -325,7 +365,6 @@ async def media(ws: WebSocket):
                             "create_response": True
                         },
                         "instructions": (
-                            # ✅ NEW: language + scope lock + “no show your work”
                             "LANGUAGE:\n"
                             "- Speak ENGLISH only. Do not switch languages.\n\n"
 
@@ -388,6 +427,7 @@ async def media(ws: WebSocket):
                     }
                 })
 
+                # Wait briefly for session.updated before greeting (keeps behavior stable)
                 session_updated = False
                 start = time.time()
                 while time.time() - start < 2.0:
