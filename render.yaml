@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: riteway-ai-agent
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.13
+      - key: PUBLIC_BASE_URL
+        value: https://riteway-ai-agent.onrender.com
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_REALTIME_MODEL
+        value: gpt-realtime-1.5
+      - key: OPENAI_VOICE
+        value: marin
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: MEDIA_STREAM_TOKEN
+        generateValue: true
+      - key: INQUIRY_WEBHOOK_URL
+        value: https://formspree.io/f/mkovqjzg
+      - key: RITEWAY_INVENTORY_URL
+        value: https://ritewaylandscapeproducts.com/api/inventory
+      - key: INVENTORY_CACHE_SECONDS
+        value: "60"
+      - key: MAX_CALL_SECONDS
+        value: "3300"
