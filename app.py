@@ -1,534 +1,582 @@
-import os
-import math
-import json
-import base64
+"""Riteway's Twilio Media Streams to OpenAI Realtime voice agent."""
+
+from __future__ import annotations
+
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
-import audioop
+import os
 import time
-import numpy as np
+from html import escape as xml_escape
+from typing import Any
+from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
+
 import aiohttp
-from collections import deque
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, PlainTextResponse
+from twilio.request_validator import RequestValidator
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, JSONResponse
+from riteway_knowledge import BUSINESS_FACTS, build_agent_instructions, load_catalog
 
-###############################################################################
-# CONFIG
-###############################################################################
 
-PUBLIC_BASE_URL = "https://riteway-ai-agent.onrender.com"
-WS_MEDIA_URL = "wss://" + PUBLIC_BASE_URL.replace("https://", "").replace("http://", "") + "/media"
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REALTIME_MODEL = "gpt-4o-realtime-preview"
-
-logging.basicConfig(level=logging.INFO)
-
-app = FastAPI(title="Riteway AI Voice Agent")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
 )
+logger = logging.getLogger("riteway_voice_agent")
 
-###############################################################################
-# AUDIO HELPERS
-###############################################################################
 
-def pcm16_to_ulaw(pcm16: np.ndarray) -> bytes:
-    """
-    Convert PCM16 numpy array -> G.711 μ-law bytes.
-    Twilio expects 8kHz μ-law, 20ms frames (160 bytes).
-    """
-    BIAS = 0x84
-    CLIP = 32635
-    out = bytearray()
-    for s in pcm16.astype(np.int32):
-        sign = 0x80 if s < 0 else 0x00
-        if s < 0:
-            s = -s
-        if s > CLIP:
-            s = CLIP
-        s = s + BIAS
-        exponent = 7
-        mask = 0x4000
-        while exponent > 0 and not (s & mask):
-            mask >>= 1
-            exponent -= 1
-        mantissa = (s >> (exponent + 3)) & 0x0F
-        ulaw_byte = ~(sign | (exponent << 4) | mantissa) & 0xFF
-        out.append(ulaw_byte)
-    return bytes(out)
+def _public_base_url() -> str:
+    configured = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if configured:
+        return configured
+    render_hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
+    if render_hostname:
+        return f"https://{render_hostname}"
+    return "https://riteway-ai-agent.onrender.com"
 
-def generate_beep_ulaw_chunks(duration_sec=0.8, freq_hz=440.0, sample_rate=8000):
-    """
-    Safety tone, in case we ever need to send audio while AI is booting.
-    We won't actively play this now unless something is badly wrong.
-    """
-    total_samples = int(duration_sec * sample_rate)
-    t = np.arange(total_samples) / sample_rate
-    pcm16 = (10000 * np.sin(2 * math.pi * freq_hz * t)).astype(np.int16)
-    ulaw_bytes = pcm16_to_ulaw(pcm16)
 
-    frame_size = 160  # 20ms @ 8kHz
-    chunks_b64 = []
-    for i in range(0, len(ulaw_bytes), frame_size):
-        frame = ulaw_bytes[i:i+frame_size]
-        if not frame:
-            continue
-        b64_payload = base64.b64encode(frame).decode("ascii")
-        chunks_b64.append(b64_payload)
+PUBLIC_BASE_URL = _public_base_url()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-1.5").strip()
+OPENAI_VOICE = os.getenv("OPENAI_VOICE", "marin").strip()
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+MEDIA_STREAM_TOKEN = os.getenv("MEDIA_STREAM_TOKEN", "").strip()
+INQUIRY_WEBHOOK_URL = os.getenv(
+    "INQUIRY_WEBHOOK_URL", "https://formspree.io/f/mkovqjzg"
+).strip()
+INVENTORY_URL = os.getenv(
+    "RITEWAY_INVENTORY_URL", "https://ritewaylandscapeproducts.com/api/inventory"
+).strip()
+INVENTORY_CACHE_SECONDS = int(os.getenv("INVENTORY_CACHE_SECONDS", "60"))
+MAX_CALL_SECONDS = int(os.getenv("MAX_CALL_SECONDS", "3300"))
 
-    return chunks_b64
+CATALOG = load_catalog()
 
-async def send_ulaw_chunks_to_twilio(ws: WebSocket, stream_sid: str, chunks_b64: list):
-    """
-    Send pre-encoded μ-law 20ms frames to Twilio with ~20ms pacing.
-    """
-    logging.info(f"🔊 sending {len(chunks_b64)} fallback frames to Twilio (sid={stream_sid})")
-    for frame_b64 in chunks_b64:
-        await ws.send_json({
-            "event": "media",
-            "streamSid": stream_sid,
-            "media": {"payload": frame_b64}
-        })
-        await asyncio.sleep(0.02)
-    logging.info("🔊 finished sending fallback frames")
 
-###############################################################################
-# ROUTES
-###############################################################################
+def _websocket_media_url() -> str:
+    parts = urlsplit(PUBLIC_BASE_URL)
+    scheme = "wss" if parts.scheme == "https" else "ws"
+    return urlunsplit((scheme, parts.netloc, "/media", "", ""))
+
+
+WS_MEDIA_URL = _websocket_media_url()
+
+app = FastAPI(title="Riteway AI Voice Agent", version="2.0.0")
+
+
+INQUIRY_TOOL = {
+    "type": "function",
+    "name": "record_inquiry",
+    "description": (
+        "Send a Riteway caller's quote, order, delivery, pickup, hauling, disposal, "
+        "schedule, or callback request to the Riteway team. Call this during the call "
+        "as soon as callback identity and a useful request summary are available."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Caller's name"},
+            "callback_phone": {
+                "type": "string",
+                "description": "Best phone number for the Riteway team to call or text",
+            },
+            "email": {"type": "string", "description": "Email, only when volunteered"},
+            "request_type": {
+                "type": "string",
+                "enum": [
+                    "quote",
+                    "order",
+                    "delivery",
+                    "pickup",
+                    "hauling",
+                    "disposal",
+                    "schedule",
+                    "callback",
+                    "other",
+                ],
+            },
+            "material": {
+                "type": "string",
+                "description": "Requested material or project type",
+            },
+            "quantity": {
+                "type": "string",
+                "description": "Requested yards, tons, loads, dimensions, or quantity",
+            },
+            "fulfillment": {
+                "type": "string",
+                "enum": ["delivery", "pickup", "unsure", "not_applicable"],
+            },
+            "city_or_zip": {"type": "string"},
+            "delivery_address": {"type": "string"},
+            "summary": {
+                "type": "string",
+                "description": "Concise request summary and any timing or access notes",
+            },
+        },
+        "required": ["name", "callback_phone", "request_type", "summary"],
+        "additionalProperties": False,
+    },
+}
+
+
+_inventory_cache: dict[str, Any] = {"expires_at": 0.0, "inventory": {}}
+_inventory_lock = asyncio.Lock()
+
+
+def build_twiml(caller_phone: str = "") -> str:
+    parameters = []
+    if MEDIA_STREAM_TOKEN:
+        parameters.append(
+            f'      <Parameter name="token" value="{xml_escape(MEDIA_STREAM_TOKEN, quote=True)}" />'
+        )
+    if caller_phone:
+        parameters.append(
+            f'      <Parameter name="callerPhone" value="{xml_escape(caller_phone, quote=True)}" />'
+        )
+    parameter_xml = f"\n{chr(10).join(parameters)}\n    " if parameters else ""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<Response>\n"
+        "  <Connect>\n"
+        f'    <Stream url="{xml_escape(WS_MEDIA_URL, quote=True)}">'
+        f"{parameter_xml}</Stream>\n"
+        "  </Connect>\n"
+        "</Response>"
+    )
+
+
+def build_unavailable_twiml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<Response>\n"
+        "  <Say>Riteway's virtual receptionist is temporarily unavailable. "
+        f"Please text {BUSINESS_FACTS['phone']} or use the inquiry form on our website.</Say>\n"
+        "</Response>"
+    )
+
+
+def build_session_update(instructions: str) -> dict[str, Any]:
+    return {
+        "type": "session.update",
+        "session": {
+            "type": "realtime",
+            "model": REALTIME_MODEL,
+            "output_modalities": ["audio"],
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcmu"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 450,
+                        "create_response": True,
+                        "interrupt_response": True,
+                    },
+                },
+                "output": {
+                    "format": {"type": "audio/pcmu"},
+                    "voice": OPENAI_VOICE,
+                },
+            },
+            "instructions": instructions,
+            "tools": [INQUIRY_TOOL],
+            "tool_choice": "auto",
+        },
+    }
+
+
+def _public_request_url(request: Request) -> str:
+    url = f"{PUBLIC_BASE_URL}{request.url.path}"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+    return url
+
+
+async def _validated_twilio_form(request: Request) -> dict[str, str]:
+    raw_body = await request.body()
+    params = dict(parse_qsl(raw_body.decode("utf-8"), keep_blank_values=True))
+    if not TWILIO_AUTH_TOKEN:
+        return params
+
+    signature = request.headers.get("x-twilio-signature", "")
+    validator = RequestValidator(TWILIO_AUTH_TOKEN)
+    if not signature or not validator.validate(_public_request_url(request), params, signature):
+        logger.warning("Rejected a request with an invalid Twilio signature")
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+    return params
+
+
+@app.get("/")
+async def root() -> dict[str, str]:
+    return {
+        "service": "Riteway AI Voice Agent",
+        "health": "/health",
+        "twilio_voice_webhook": "/voice",
+    }
+
 
 @app.get("/health")
-async def health():
-    return JSONResponse({
-        "ok": True,
+async def health() -> JSONResponse:
+    ready = bool(OPENAI_API_KEY and CATALOG.get("products"))
+    body = {
+        "ok": ready,
+        "version": app.version,
         "model": REALTIME_MODEL,
-        "has_api_key": bool(OPENAI_API_KEY)
-    })
+        "voice": OPENAI_VOICE,
+        "catalog_products": CATALOG.get("orderable_product_count", 0),
+        "openai_configured": bool(OPENAI_API_KEY),
+        "twilio_signature_validation": bool(TWILIO_AUTH_TOKEN),
+        "media_stream_authentication": bool(MEDIA_STREAM_TOKEN),
+        "inquiry_capture_configured": bool(INQUIRY_WEBHOOK_URL),
+    }
+    return JSONResponse(body, status_code=200 if ready else 503)
+
 
 @app.post("/voice", response_class=PlainTextResponse)
-async def voice(_: Request):
-    logging.info("☎ Twilio hit /voice")
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="{WS_MEDIA_URL}" />
-  </Connect>
-</Response>"""
-    return PlainTextResponse(content=twiml, media_type="application/xml")
+async def voice(request: Request) -> PlainTextResponse:
+    params = await _validated_twilio_form(request)
+    logger.info("Twilio requested call instructions call_sid=%s", params.get("CallSid", "unknown"))
+    twiml = build_twiml(params.get("From", "")) if OPENAI_API_KEY else build_unavailable_twiml()
+    return PlainTextResponse(twiml, media_type="application/xml")
 
-@app.websocket("/media")
-async def media(ws: WebSocket):
-    await ws.accept()
-    logging.info("✅ Twilio connected to /media")
 
-    stream_sid = None
-    openai_connected = False
-    oai_ws_handle = None
+async def get_inventory(http_session: aiohttp.ClientSession) -> dict[str, Any]:
+    if not INVENTORY_URL:
+        return {}
 
-    playback_queue = deque()
-    playback_running = True
-    playback_task = None
+    now = time.monotonic()
+    if _inventory_cache["inventory"] and now < _inventory_cache["expires_at"]:
+        return dict(_inventory_cache["inventory"])
 
-    ai_speaking = False
-
-    # -------------------------
-    # BARGE-IN (FAST + ROBUST)
-    # -------------------------
-    # Key fixes for the “~3 second delay”:
-    # 1) Send Twilio "clear" immediately on barge-in (flushes Twilio jitter/playout buffer)
-    # 2) Use an adaptive noise floor (so we ignore background noise but trigger quickly on real speech)
-    # 3) Lower required frames by default + add a fast-trigger for obvious speech
-    #
-    # You can still override any of these with Render env vars.
-    BARGE_RMS_MIN = int(os.getenv("BARGE_RMS_MIN", "650"))                 # absolute floor
-    BARGE_NOISE_MULT = float(os.getenv("BARGE_NOISE_MULT", "3.0"))         # noise * mult -> threshold
-    BARGE_FRAMES_REQUIRED = int(os.getenv("BARGE_FRAMES_REQUIRED", "2"))   # 2 frames ~ 40ms
-    BARGE_PEAK_MIN = int(os.getenv("BARGE_PEAK_MIN", "2200"))              # ignore very soft hum
-    BARGE_FAST_TRIGGER_RATIO = float(os.getenv("BARGE_FAST_TRIGGER_RATIO", "1.8"))  # instant if rms > thr*ratio
-    BARGE_CANCEL_COOLDOWN_MS = int(os.getenv("BARGE_CANCEL_COOLDOWN_MS", "120"))
-
-    # Optional ZCR gate (off by default; ZCR can be device-dependent)
-    BARGE_USE_ZCR = os.getenv("BARGE_USE_ZCR", "0") == "1"
-    BARGE_ZCR_MIN = float(os.getenv("BARGE_ZCR_MIN", "0.02"))
-    BARGE_ZCR_MAX = float(os.getenv("BARGE_ZCR_MAX", "0.22"))
-
-    barge_speech_frames = 0
-    last_cancel_ts = 0.0
-
-    # Adaptive noise floor (EMA)
-    noise_rms_ema = float(os.getenv("NOISE_RMS_INIT", "200"))  # starting guess
-    NOISE_EMA_ALPHA = float(os.getenv("NOISE_EMA_ALPHA", "0.05"))
-    NOISE_UPDATE_RMS_CAP = int(os.getenv("NOISE_UPDATE_RMS_CAP", "900"))   # don't learn on loud speech
-    NOISE_UPDATE_WHEN_AI_SPEAKING = os.getenv("NOISE_UPDATE_WHEN_AI_SPEAKING", "0") == "1"
-
-    if not OPENAI_API_KEY:
-        logging.error("❌ No OPENAI_API_KEY in environment.")
-    else:
-        logging.info("🔑 OPENAI_API_KEY is present")
-
-    async def playback_loop():
-        await asyncio.sleep(0.1)
-        nonlocal playback_running, ai_speaking
-        while playback_running:
-            if playback_queue and stream_sid:
-                frame_b64 = playback_queue.popleft()
-                await ws.send_json({
-                    "event": "media",
-                    "streamSid": stream_sid,
-                    "media": {"payload": frame_b64},
-                })
-                await asyncio.sleep(0.02)
-            else:
-                ai_speaking = False
-                await asyncio.sleep(0.005)
-
-    async def twilio_clear_audio():
-        """
-        Ask Twilio to immediately flush any buffered outbound audio.
-        This is what removes that “keeps talking for seconds” feeling.
-        """
-        if not stream_sid:
-            return
+    async with _inventory_lock:
+        now = time.monotonic()
+        if _inventory_cache["inventory"] and now < _inventory_cache["expires_at"]:
+            return dict(_inventory_cache["inventory"])
         try:
-            await ws.send_json({"event": "clear", "streamSid": stream_sid})
-        except Exception:
-            pass
+            timeout = aiohttp.ClientTimeout(total=3)
+            async with http_session.get(INVENTORY_URL, timeout=timeout) as response:
+                response.raise_for_status()
+                payload = await response.json()
+                inventory = payload.get("inventory", {})
+                if not isinstance(inventory, dict):
+                    raise ValueError("Inventory response did not contain an inventory object")
+                _inventory_cache["inventory"] = inventory
+                _inventory_cache["expires_at"] = now + INVENTORY_CACHE_SECONDS
+                logger.info("Loaded live inventory for %d products", len(inventory))
+                return dict(inventory)
+        except Exception as exc:
+            logger.warning("Live inventory unavailable: %s", type(exc).__name__)
+            return dict(_inventory_cache.get("inventory") or {})
 
-    async def cancel_openai_response_if_real_speech(ulaw_bytes: bytes):
-        nonlocal ai_speaking, barge_speech_frames, last_cancel_ts, noise_rms_ema
 
-        # Always compute RMS/Peak so we can keep learning the noise floor (when appropriate)
-        try:
-            pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)
-            rms = audioop.rms(pcm16_8k, 2)
-            peak = audioop.max(pcm16_8k, 2)
-        except Exception:
-            barge_speech_frames = 0
-            return
-
-        # Update noise floor when not speaking (or if you explicitly allow learning during AI speech)
-        can_learn_noise = (not ai_speaking) or NOISE_UPDATE_WHEN_AI_SPEAKING
-        if can_learn_noise and rms <= NOISE_UPDATE_RMS_CAP:
-            noise_rms_ema = (1.0 - NOISE_EMA_ALPHA) * noise_rms_ema + NOISE_EMA_ALPHA * float(rms)
-
-        # If AI isn't speaking, don't barge-cancel anything.
-        if not oai_ws_handle or not ai_speaking:
-            barge_speech_frames = 0
-            return
-
-        now = time.time()
-        if (now - last_cancel_ts) * 1000 < BARGE_CANCEL_COOLDOWN_MS:
-            return
-
-        # Dynamic threshold derived from noise floor + absolute floor
-        dyn_thr = max(BARGE_RMS_MIN, int(noise_rms_ema * BARGE_NOISE_MULT))
-
-        # Optional ZCR test (off by default)
-        zcr_ok = True
-        zcr_val = None
-        if BARGE_USE_ZCR:
-            try:
-                samples = np.frombuffer(pcm16_8k, dtype=np.int16)
-                if samples.size >= 2:
-                    signs = np.sign(samples)
-                    zcr_val = float(np.mean(signs[1:] != signs[:-1]))
-                    zcr_ok = (BARGE_ZCR_MIN <= zcr_val <= BARGE_ZCR_MAX)
-            except Exception:
-                zcr_ok = False
-
-        speech_like = (rms >= dyn_thr) and (peak >= BARGE_PEAK_MIN) and zcr_ok
-
-        # Fast trigger: if it's clearly above threshold, cancel immediately (no multi-frame wait)
-        fast_trigger = (rms >= int(dyn_thr * BARGE_FAST_TRIGGER_RATIO)) and (peak >= int(BARGE_PEAK_MIN * 1.1))
-
-        if fast_trigger:
-            barge_speech_frames = BARGE_FRAMES_REQUIRED
-        elif speech_like:
-            barge_speech_frames += 1
-        else:
-            barge_speech_frames = max(0, barge_speech_frames - 1)
-
-        if barge_speech_frames < BARGE_FRAMES_REQUIRED:
-            return
-
-        # Confirmed barge-in: stop audio NOW
-        barge_speech_frames = 0
-        playback_queue.clear()
-        ai_speaking = False
-        last_cancel_ts = now
-
-        # Critical: flush Twilio playout buffer
-        await twilio_clear_audio()
-
-        # Stop OpenAI response generation
-        try:
-            await oai_ws_handle.send_json({"type": "response.cancel"})
-        except Exception:
-            pass
-
-        logging.info(
-            f"🛑 BARGE-IN: cancel (rms={rms}, peak={peak}, dyn_thr={dyn_thr}, "
-            f"noise_ema={noise_rms_ema:.1f}, frames={BARGE_FRAMES_REQUIRED}, "
-            f"fast={fast_trigger}, zcr={'on' if BARGE_USE_ZCR else 'off'}"
-            f"{'' if zcr_val is None else f', zcr={zcr_val:.3f}'}"
-            f")"
-        )
-
-    async def forward_twilio_to_openai(oai_ws):
-        nonlocal stream_sid
-        nonlocal openai_connected
-        nonlocal oai_ws_handle
-
+async def _wait_for_twilio_start(websocket: WebSocket) -> tuple[str, str, str]:
+    async with asyncio.timeout(10):
         while True:
-            try:
-                msg = await ws.receive_text()
-            except WebSocketDisconnect:
-                logging.info("❌ Twilio websocket disconnected")
-                break
-            except Exception:
-                logging.exception("💥 Error receiving from Twilio WebSocket")
-                break
-
-            try:
-                data = json.loads(msg)
-            except json.JSONDecodeError:
-                logging.warning(f"⚠ got non-JSON from Twilio: {msg}")
+            raw_message = await websocket.receive_text()
+            message = json.loads(raw_message)
+            if message.get("event") != "start":
                 continue
 
-            event = data.get("event")
+            start = message.get("start") or {}
+            custom = start.get("customParameters") or {}
+            received_token = str(custom.get("token") or "")
+            if MEDIA_STREAM_TOKEN and not hmac.compare_digest(
+                received_token, MEDIA_STREAM_TOKEN
+            ):
+                raise PermissionError("Invalid media stream token")
 
-            if event == "connected":
-                logging.info(f"ℹ Twilio event connected: {data}")
+            stream_sid = str(start.get("streamSid") or message.get("streamSid") or "")
+            if not stream_sid:
+                raise ValueError("Twilio start event did not include a streamSid")
+            return (
+                stream_sid,
+                str(start.get("callSid") or ""),
+                str(custom.get("callerPhone") or ""),
+            )
 
-            elif event == "start":
-                stream_sid = data["start"]["streamSid"]
-                call_sid = data["start"].get("callSid")
-                logging.info(f"📞 Twilio start: streamSid={stream_sid} callSid={call_sid}")
 
-            elif event == "media":
-                payload_b64 = data["media"]["payload"]
-                ulaw_bytes = base64.b64decode(payload_b64)
+async def _configure_realtime(oai_websocket: aiohttp.ClientWebSocketResponse, instructions: str) -> None:
+    await oai_websocket.send_json(build_session_update(instructions))
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        message = await asyncio.wait_for(
+            oai_websocket.receive(), timeout=max(0.1, deadline - time.monotonic())
+        )
+        if message.type != aiohttp.WSMsgType.TEXT:
+            if message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                raise RuntimeError("OpenAI closed before the Realtime session was configured")
+            continue
+        event = json.loads(message.data)
+        event_type = event.get("type")
+        if event_type == "session.updated":
+            return
+        if event_type == "error":
+            error = event.get("error") or event
+            raise RuntimeError(f"OpenAI session error: {error.get('message', 'unknown error')}")
+    raise TimeoutError("OpenAI did not confirm session.updated")
 
-                await cancel_openai_response_if_real_speech(ulaw_bytes)
 
-                pcm16_8k = audioop.ulaw2lin(ulaw_bytes, 2)
-                pcm16_24k, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 24000, None)
+def _clean(value: Any, maximum: int = 1_000) -> str:
+    return " ".join(str(value or "").split())[:maximum]
 
-                if oai_ws and openai_connected:
-                    try:
-                        b64_for_openai = base64.b64encode(pcm16_24k).decode("ascii")
-                        await oai_ws.send_json({
-                            "type": "input_audio_buffer.append",
-                            "audio": b64_for_openai,
-                        })
-                    except Exception:
-                        logging.exception("💥 Error sending audio to OpenAI")
 
-            elif event == "stop":
-                logging.info("📴 Twilio sent stop (caller hung up)")
-                break
+async def _record_inquiry(
+    http_session: aiohttp.ClientSession,
+    arguments: dict[str, Any],
+    call_sid: str,
+    caller_phone: str,
+) -> dict[str, Any]:
+    callback_phone = _clean(arguments.get("callback_phone") or caller_phone, 80)
+    payload = {
+        "_subject": "New Riteway AI phone inquiry",
+        "source": "Riteway AI phone agent",
+        "name": _clean(arguments.get("name"), 120),
+        "phone": callback_phone,
+        "email": _clean(arguments.get("email"), 200),
+        "request_type": _clean(arguments.get("request_type"), 80),
+        "material": _clean(arguments.get("material"), 200),
+        "quantity": _clean(arguments.get("quantity"), 160),
+        "fulfillment": _clean(arguments.get("fulfillment"), 80),
+        "city_or_zip": _clean(arguments.get("city_or_zip"), 160),
+        "delivery_address": _clean(arguments.get("delivery_address"), 300),
+        "message": _clean(arguments.get("summary"), 2_000),
+        "call_sid": _clean(call_sid, 80),
+        "caller_phone": _clean(caller_phone, 80),
+    }
 
-            else:
-                logging.info(f"ℹ Twilio event {event}: {data}")
+    if not INQUIRY_WEBHOOK_URL:
+        return {"saved": False, "message": "The inquiry webhook is not configured."}
 
-        logging.info("🚪 forward_twilio_to_openai exiting")
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with http_session.post(
+            INQUIRY_WEBHOOK_URL,
+            json=payload,
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        ) as response:
+            if 200 <= response.status < 300:
+                logger.info("Recorded Riteway inquiry call_sid=%s", call_sid or "unknown")
+                return {
+                    "saved": True,
+                    "message": "The inquiry was sent to the Riteway team for follow-up.",
+                }
+            logger.error("Inquiry webhook returned HTTP %s", response.status)
+    except Exception as exc:
+        logger.error("Inquiry webhook failed: %s", type(exc).__name__)
+    return {
+        "saved": False,
+        "message": "The inquiry could not be sent. Ask the caller to text Riteway or use the website form.",
+    }
 
-    async def forward_openai_to_twilio(oai_ws):
-        nonlocal openai_connected
-        nonlocal ai_speaking
 
+async def _handle_function_calls(
+    event: dict[str, Any],
+    oai_websocket: aiohttp.ClientWebSocketResponse,
+    http_session: aiohttp.ClientSession,
+    call_sid: str,
+    caller_phone: str,
+) -> None:
+    outputs = (event.get("response") or {}).get("output") or []
+    handled = False
+    for item in outputs:
+        if item.get("type") != "function_call" or item.get("name") != "record_inquiry":
+            continue
+        call_id = item.get("call_id")
+        if not call_id:
+            continue
         try:
-            async for raw in oai_ws:
-                if raw.type != aiohttp.WSMsgType.TEXT:
-                    continue
+            arguments = json.loads(item.get("arguments") or "{}")
+            if not isinstance(arguments, dict):
+                raise ValueError("Function arguments must be an object")
+            result = await _record_inquiry(http_session, arguments, call_sid, caller_phone)
+        except Exception as exc:
+            logger.warning("Invalid record_inquiry call: %s", type(exc).__name__)
+            result = {"saved": False, "message": "The inquiry details were invalid."}
 
-                data = json.loads(raw.data)
-                oai_type = data.get("type")
-                logging.info(f"🤖 OAI event: {oai_type}")
-
-                openai_connected = True
-
-                if oai_type == "response.audio.delta":
-                    ulaw_chunk_b64 = data.get("delta")
-                    if ulaw_chunk_b64:
-                        ai_speaking = True
-                        playback_queue.append(ulaw_chunk_b64)
-
-                elif oai_type in ("response.done", "response.completed"):
-                    ai_speaking = False
-                    logging.info("✅ AI finished a spoken response")
-
-                elif oai_type == "response.interrupted":
-                    ai_speaking = False
-                    playback_queue.clear()
-                    logging.info("🛑 AI response interrupted")
-
-                elif oai_type == "error":
-                    ai_speaking = False
-                    logging.error(f"❌ OpenAI internal error event: {data}")
-
-        except Exception:
-            logging.exception("💥 Error while reading from OpenAI ws (forward_openai_to_twilio)")
-        logging.info("🚪 forward_openai_to_twilio exiting")
-
-    if not OPENAI_API_KEY:
-        logging.error("❌ OPENAI_API_KEY missing. Skipping OpenAI connect.")
-        await forward_twilio_to_openai(None)
-        logging.info("🔚 /media connection closed (no OpenAI)")
-        return
-
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.ws_connect(
-                f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "OpenAI-Beta": "realtime=v1",
+        await oai_websocket.send_json(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps(result),
                 },
-            ) as oai_ws:
-                logging.info("✅ Connected to OpenAI Realtime successfully!")
-                openai_connected = True
-                oai_ws_handle = oai_ws
+            }
+        )
+        handled = True
 
-                await oai_ws.send_json({
-                    "type": "session.update",
-                    "session": {
-                        "modalities": ["audio", "text"],
-                        "input_audio_format": "pcm16",
-                        "output_audio_format": "g711_ulaw",
-                        "voice": "alloy",
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.5,
-                            "silence_duration_ms": 300,
-                            "create_response": True
-                        },
-                        "instructions": (
-                            "LANGUAGE:\n"
-                            "- Speak ENGLISH only. Do not switch languages.\n\n"
+    if handled:
+        await oai_websocket.send_json(
+            {"type": "response.create", "response": {"output_modalities": ["audio"]}}
+        )
 
-                            "ROLE:\n"
-                            "You are Tammy, the live phone receptionist for Riteway Landscape Products.\n"
-                            "You are speaking to callers on the phone.\n"
-                            "Never talk as if you are the caller.\n"
-                            "If you greet, greet the caller (do not greet Tammy).\n\n"
 
-                            "SCOPE (IMPORTANT):\n"
-                            "- You are NOT a general purpose assistant.\n"
-                            "- ONLY answer questions related to Riteway Landscape Products and landscape materials.\n"
-                            "- Allowed topics: product/pricing, delivery areas/fees, scheduling within business hours,\n"
-                            "  loading limits (16 yards), and yardage/material estimates for landscaping.\n"
-                            "- If asked about anything else (history, trivia, politics, random questions, etc.),\n"
-                            "  politely refuse and redirect back to landscape materials.\n"
-                            "  Example refusal: \"I can only help with Riteway landscape materials, pricing, delivery, or yardage estimates. What material are you working with?\"\n\n"
+async def _twilio_to_openai(
+    twilio_websocket: WebSocket,
+    oai_websocket: aiohttp.ClientWebSocketResponse,
+) -> None:
+    while True:
+        try:
+            raw_message = await twilio_websocket.receive_text()
+        except WebSocketDisconnect:
+            return
+        message = json.loads(raw_message)
+        event_type = message.get("event")
+        if event_type == "media":
+            audio = (message.get("media") or {}).get("payload")
+            if audio:
+                await oai_websocket.send_json(
+                    {"type": "input_audio_buffer.append", "audio": audio}
+                )
+        elif event_type == "stop":
+            return
 
-                            "STYLE:\n"
-                            "- Speak warm, professional, confident, and efficient.\n"
-                            "- Keep each answer under 30 seconds.\n"
-                            "- If the caller starts talking, stop and let them finish.\n"
-                            "- When doing calculations, do NOT explain your steps or reasoning.\n"
-                            "  Give ONLY the final result and one short helpful sentence.\n\n"
 
-                            "BUSINESS INFO:\n"
-                            "- Business: Riteway Landscape Products.\n"
-                            "- We sell bulk landscape material by the cubic yard.\n"
-                            "- We are open Monday–Friday, 9 AM to 5 PM. No after-hours or weekend scheduling.\n"
-                            "- We mainly serve Tooele Valley and surrounding areas.\n\n"
+async def _openai_to_twilio(
+    oai_websocket: aiohttp.ClientWebSocketResponse,
+    twilio_websocket: WebSocket,
+    http_session: aiohttp.ClientSession,
+    stream_sid: str,
+    call_sid: str,
+    caller_phone: str,
+) -> None:
+    async for message in oai_websocket:
+        if message.type != aiohttp.WSMsgType.TEXT:
+            if message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                return
+            continue
 
-                            "PRICING (ALWAYS say 'per yard' or 'per ton'):\n"
-                            "- Washed Pea Gravel: $42 per yard.\n"
-                            "- Desert Sun 7/8\" Crushed Rock: $40 per yard.\n"
-                            "- 7/8\" Crushed Rock: $25 per yard.\n"
-                            "- Desert Sun 1.5\" Crushed Rock: $40 per yard.\n"
-                            "- 1.5\" Crushed Rock: $25 per yard.\n"
-                            "- Commercial Road Base: $20 per yard.\n"
-                            "- 3/8\" Minus Fines: $12 per yard.\n"
-                            "- Desert Sun 1–3\" Cobble: $40 per yard.\n"
-                            "- 8\" Landscape Cobble: $40 per yard.\n"
-                            "- Desert Sun Boulders: $75 per ton.\n"
-                            "- Fill Dirt: $12 per yard.\n"
-                            "- Top Soil: $26 per yard.\n"
-                            "- Screened Premium Top Soil: $40 per yard.\n"
-                            "- Washed Sand: $65 per yard.\n"
-                            "- Premium Mulch: $44 per yard.\n"
-                            "- Colored Shredded Bark: $76 per yard.\n\n"
+        event = json.loads(message.data)
+        event_type = event.get("type")
+        if event_type in ("response.output_audio.delta", "response.audio.delta"):
+            audio = event.get("delta")
+            if audio:
+                await twilio_websocket.send_json(
+                    {"event": "media", "streamSid": stream_sid, "media": {"payload": audio}}
+                )
+        elif event_type == "input_audio_buffer.speech_started":
+            await twilio_websocket.send_json({"event": "clear", "streamSid": stream_sid})
+        elif event_type == "response.done":
+            await _handle_function_calls(
+                event,
+                oai_websocket,
+                http_session,
+                call_sid,
+                caller_phone,
+            )
+        elif event_type == "error":
+            error = event.get("error") or event
+            logger.error(
+                "OpenAI Realtime error code=%s message=%s",
+                error.get("code", "unknown"),
+                _clean(error.get("message"), 300),
+            )
 
-                            "DELIVERY:\n"
-                            "- Up to 16 yards per load.\n"
-                            "- $75 to Grantsville.\n"
-                            "- $115 to rest of Tooele Valley.\n"
-                            "- Outside valley: ask address, repeat it, say $7/mile from Grantsville yard; dispatch confirms total.\n\n"
 
-                            "YARDAGE ESTIMATES (no step-by-step):\n"
-                            "- Use: yards = (L_ft * W_ft * (D_in/12)) / 27, rounded to 1 decimal.\n"
-                            "- Also: 1 yard covers ~100 sq ft at ~3 inches.\n"
-                        )
-                    }
-                })
+async def _run_call_bridge(
+    twilio_websocket: WebSocket,
+    stream_sid: str,
+    call_sid: str,
+    caller_phone: str,
+) -> None:
+    async with aiohttp.ClientSession() as http_session:
+        inventory = await get_inventory(http_session)
+        instructions = build_agent_instructions(CATALOG, inventory, caller_phone)
+        model = quote(REALTIME_MODEL, safe="")
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+        if caller_phone:
+            safety_id = hashlib.sha256(caller_phone.encode("utf-8")).hexdigest()[:32]
+            headers["OpenAI-Safety-Identifier"] = safety_id
 
-                # Wait briefly for session.updated before greeting
-                session_updated = False
-                start = time.time()
-                while time.time() - start < 2.0:
-                    try:
-                        msg = await oai_ws.receive(timeout=2.0)
-                    except Exception:
-                        break
-                    if msg.type != aiohttp.WSMsgType.TEXT:
-                        continue
-                    try:
-                        data = json.loads(msg.data)
-                    except Exception:
-                        continue
-                    t = data.get("type")
-                    logging.info(f"🤖 OAI event (pre-loop): {t}")
-                    if t == "session.updated":
-                        session_updated = True
-                        break
-                if not session_updated:
-                    logging.warning("⚠ Did not confirm session.updated before greeting (continuing anyway).")
-
-                await oai_ws.send_json({
+        async with http_session.ws_connect(
+            f"wss://api.openai.com/v1/realtime?model={model}",
+            headers=headers,
+            heartbeat=20,
+            max_msg_size=0,
+        ) as oai_websocket:
+            await _configure_realtime(oai_websocket, instructions)
+            await oai_websocket.send_json(
+                {
                     "type": "response.create",
                     "response": {
-                        "modalities": ["audio", "text"],
+                        "output_modalities": ["audio"],
                         "instructions": (
-                            "You are speaking to the caller. "
-                            "Say EXACTLY and ONLY this sentence, then stop: "
-                            "Hey, I’m Tammy with Riteway Landscape Products. How can I help you?"
-                        )
-                    }
-                })
-
-                playback_task = asyncio.create_task(playback_loop())
-
-                await asyncio.gather(
-                    forward_twilio_to_openai(oai_ws_handle),
-                    forward_openai_to_twilio(oai_ws_handle),
-                )
-
-        except Exception:
-            logging.exception(
-                "❌ Failed to connect to OpenAI Realtime! "
-                "Possible causes: invalid OPENAI_API_KEY or missing model access."
+                            "Greet the caller in one sentence. Say: Hi, you've reached Riteway "
+                            "Landscape Products. I'm Tammy, the virtual receptionist. How can I "
+                            "help with your project?"
+                        ),
+                    },
+                }
             )
-            await forward_twilio_to_openai(None)
 
-    playback_running = False
-    if playback_task:
-        await asyncio.sleep(0.1)
-        playback_task.cancel()
+            tasks = {
+                asyncio.create_task(
+                    _twilio_to_openai(twilio_websocket, oai_websocket),
+                    name="twilio_to_openai",
+                ),
+                asyncio.create_task(
+                    _openai_to_twilio(
+                        oai_websocket,
+                        twilio_websocket,
+                        http_session,
+                        stream_sid,
+                        call_sid,
+                        caller_phone,
+                    ),
+                    name="openai_to_twilio",
+                ),
+            }
+            done, pending = await asyncio.wait(
+                tasks, timeout=MAX_CALL_SECONDS, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                if task.cancelled():
+                    continue
+                error = task.exception()
+                if error and not isinstance(
+                    error, (WebSocketDisconnect, asyncio.CancelledError)
+                ):
+                    raise error
 
-    logging.info("🔚 /media connection closed")
+
+@app.websocket("/media")
+async def media(websocket: WebSocket) -> None:
+    await websocket.accept()
+    call_sid = ""
+    try:
+        if not OPENAI_API_KEY:
+            await websocket.close(code=1011, reason="Voice agent is not configured")
+            return
+        stream_sid, call_sid, caller_phone = await _wait_for_twilio_start(websocket)
+        logger.info("Started Riteway voice call call_sid=%s", call_sid or "unknown")
+        await _run_call_bridge(websocket, stream_sid, call_sid, caller_phone)
+    except PermissionError:
+        logger.warning("Rejected unauthorized media stream")
+        await websocket.close(code=1008, reason="Unauthorized media stream")
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass
+    except Exception as exc:
+        logger.exception(
+            "Voice call failed call_sid=%s error=%s", call_sid or "unknown", type(exc).__name__
+        )
+        try:
+            await websocket.close(code=1011, reason="Voice agent connection failed")
+        except Exception:
+            pass
+    finally:
+        logger.info("Ended Riteway voice call call_sid=%s", call_sid or "unknown")
+
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "10000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
